@@ -21,7 +21,7 @@ import openai
 import time
 
 # Replace 'your-api-key' with your actual OpenAI API key
-openai.api_key = 'sk-proj-XARXsDRWzQoADSpC48UkT3BlbkFJf2lnyQGnMClu9dQEzZbV'
+openai.api_key = 'your-api-key'
 
 # Function to create prompt for the API
 def get_estimated_cook_time(prompt):
