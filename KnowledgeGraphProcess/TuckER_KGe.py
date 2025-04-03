@@ -1,1540 +1,641 @@
-#import library 
+# -*- coding: utf-8 -*-
+"""
+Refactored script for building a recipe knowledge graph, training a KGE model (TuckER),
+and evaluating its performance on recommendation scenarios with varying criteria complexity.
+"""
+
+import logging
+import os
+import random
+from itertools import combinations, product
+from pathlib import Path
+from typing import Any, Dict, List, Set, Tuple
+
 import networkx as nx
 import numpy as np
-from pykeen.pipeline import pipeline
-from pykeen.triples import TriplesFactory
-from sklearn.model_selection import train_test_split
-from sklearn.metrics.pairwise import cosine_similarity
 import pandas as pd
-from pykeen.hpo import hpo_pipeline
-
-
-# Load the CSV file
-file_path = '/app/BalancedRecipe_entity_linking.csv'
-recipes_df = pd.read_csv(file_path)
-recipes_df = recipes_df.drop_duplicates(subset='Name', keep='first')  # Ensure unique recipes
-recipes_df = recipes_df.reset_index(drop=True)  #
-
-UNKNOWN_PLACEHOLDER = 'Unknown'
-
-# Helper function to create valid node labels
-def create_node_label(label):
-    if isinstance(label, str):
-        return label.replace(" ", "_").replace("-", "_").replace(">", "").replace("<", "less_than_").strip().lower()
-    return str(label)
-
-# Convert the dataframe into the required format for the graph
-def process_recipes(df):
-    recipes = {}
-    for _, row in df.iterrows():
-        recipe_name = create_node_label(row['Name'])
-        best_foodentityname = [create_node_label(ing.strip()) for ing in row['best_foodentityname'].split(',')]
-        healthy_types = [create_node_label(ht.strip()) for ht in row['Healthy_Type'].split(',')] if pd.notna(row['Healthy_Type']) else []
-        meal_types = [create_node_label(mt.strip()) for mt in row['meal_type'].split(',')] if pd.notna(row['meal_type']) else []
-        cook_time = create_node_label(row['cook_time'])
-        diet_types = [create_node_label(dt.strip()) for dt in row.get('Diet_Types', '').split(',')] if pd.notna(row['Diet_Types']) else [UNKNOWN_PLACEHOLDER]
-        region_countries = [create_node_label(rc.strip()) for rc in row['CleanedRegion'].split(',')] if pd.notna(row['CleanedRegion']) else []
-
-        recipes[recipe_name] = {
-            "ingredients": best_foodentityname,
-            "diet_types": diet_types,
-            "meal_type": meal_types,
-            "cook_time": cook_time,
-            "region_countries": region_countries,
-            "healthy_types": healthy_types,
-        }
-    return recipes
-
-recipes = process_recipes(recipes_df)
-
-# Create graph and triples based on correct relationships
-def create_graph_and_triples(recipes):
-    G = nx.Graph()
-    triples = []
-
-    for recipe, details in recipes.items():
-        G.add_node(recipe, type='recipe')
-        for relation_type, elements in details.items():
-            if isinstance(elements, list):  # Handle lists
-                for element in elements:
-                    if element != UNKNOWN_PLACEHOLDER:
-                        if relation_type == 'healthy_types':
-                            # Generalize the relation to HasProteinLevel, HasCarbLevel, etc.
-                            if 'protein' in element:
-                                relation = 'HasProteinLevel'
-                            elif 'carb' in element:
-                                relation = 'HasCarbLevel'
-                            elif 'fat' in element and 'Saturated' not in element:
-                                relation = 'HasFatLevel'
-                            elif 'Saturated Fat' in element:
-                                relation = 'HasSaturatedFatLevel'
-                            elif 'calorie' in element:
-                                relation = 'HasCalorieLevel'
-                            elif 'sodium' in element:
-                                relation = 'HasSodiumLevel'
-                            elif 'sugar' in element:
-                                relation = 'HasSugarLevel'
-                            elif 'fiber' in element:
-                                relation = 'HasFiberLevel'
-                            elif 'cholesterol' in element:
-                                relation = 'HasCholesterolLevel'
-                            else:
-                                relation = 'HasHealthAttribute'  # For other health attributes
-                            G.add_node(element, type=relation)
-                        else:## Has camel Case 
-                            G.add_node(element, type=relation_type)
-                            relation = {
-                                'ingredients': 'contains',
-                                'diet_types': 'hasDietType',
-                                'meal_type': 'isForMealType',
-                                'cook_time': 'needTimeToCook',
-                                'region_countries': 'isFromRegion',
-                            }.get(relation_type, 'hasAttribute')
-                        G.add_edge(recipe, element, relation=relation)
-                        triples.append((recipe, relation, element))
-            else:  # Handle single elements like cook_time
-                if elements != UNKNOWN_PLACEHOLDER:
-                    G.add_node(elements, type=relation_type)
-                    relation = {
-                        'cook_time': 'needTimeToCook',
-                        'ingredients': 'contains',
-                        'diet_types': 'hasDietType',
-                        'meal_type': 'isForMealType',
-                        'cook_time': 'needTimeToCook',
-                        'region_countries': 'isFromRegion',
-                    }.get(relation_type, 'hasAttribute')
-                    G.add_edge(recipe, elements, relation=relation)
-                    triples.append((recipe, relation, elements))
-
-    return G, np.array(triples, dtype=str)
-
-# Process the recipes to create the graph and triples
-G, triples_array = create_graph_and_triples(recipes)
-
-
-# Convert the triples array into a pandas DataFrame
-triples_df = pd.DataFrame(triples_array, columns=['Head', 'Relation', 'Tail'])
-
-
-triples_df.to_csv('/app/recipes_triples_10000sample.csv',index=False)
-
-
-
-import pandas as pd 
-df=pd.read_csv('/app/recipes_triples_10000sample.csv')
-df=df.dropna()
-#df_filtered = df[df['Relation'] != 'contains']
-
-# Assuming df is your DataFrame
-triples = df[['Head', 'Relation', 'Tail']].values  # This returns a NumPy array directly
-
-# Create a TriplesFactory
-triples_factory = TriplesFactory.from_labeled_triples(triples)
-
-#training, testing, validation = triples_factory.split([7., .2, .1],randomize_cleanup=True)
-
-
-
-
-
-import pandas as pd
+from pykeen.pipeline import PipelineResult, pipeline
 from pykeen.predict import predict_target
-from itertools import product
-#nohup python3 testPytorchRotatE.py > output.log &
-# Load the data
-triples_df = pd.read_csv('/app/recipes_triples_10000sample.csv')
-file_path = '/app/BalancedRecipe_entity_linking.csv'
-recipes_df = pd.read_csv(file_path)
-recipes_df = recipes_df.drop_duplicates(subset='Name', keep='first')  # Ensure unique recipes
-recipes_df = recipes_df.reset_index(drop=True)
+from pykeen.triples import TriplesFactory
 
-# Process the dataframe and clean labels
-def process_recipes_dataframe(df):
-    df['Name'] = df['Name'].apply(create_node_label)
-    df['RecipeIngredientParts'] = df['RecipeIngredientParts'].apply(lambda x: ','.join([create_node_label(ing.strip()) for ing in x.split(',')]))
-    df['Healthy_Type'] = df['Healthy_Type'].apply(lambda x: ','.join([create_node_label(ht.strip()) for ht in x.split(',')]) if pd.notna(x) else '')
-    df['meal_type'] = df['meal_type'].apply(lambda x: ','.join([create_node_label(mt.strip()) for mt in x.split(',')]) if pd.notna(x) else '')
-    df['cook_time'] = df['cook_time'].apply(create_node_label)
-    df['Diet_Types'] = df['Diet_Types'].apply(lambda x: ','.join([create_node_label(dt.strip()) for dt in x.split(',')]) if pd.notna(x) else 'UNKNOWN_PLACEHOLDER')
-    df['CleanedRegion'] = df['CleanedRegion'].apply(lambda x: ','.join([create_node_label(rc.strip()) for rc in x.split(',')]) if pd.notna(x) else '')
-    df['best_foodentityname'] = df['best_foodentityname'].apply(lambda x: ','.join([create_node_label(entity.strip()) for entity in x.split(',')]) if pd.notna(x) else '')
-    return df
+# --- Configuration & Constants ---
 
-# Process the dataframe
-recipes_df = process_recipes_dataframe(recipes_df)
+# File Paths
+BASE_DIR = Path("/app") # Use Pathlib for better path handling
+INPUT_CSV_PATH = BASE_DIR / "BalancedRecipe_entity_linking.csv"
+TRIPLES_OUTPUT_PATH = BASE_DIR / "recipes_triples_clean.csv"
+RESULTS_DIR = BASE_DIR / "TuckER_EvaluationResults_Clean"
 
-# Extract the top 50 most common ingredients from 'best_foodentityname'
-ingredient_counts = recipes_df['best_foodentityname'].apply(lambda x: [ingredient.strip() for ingredient in x.split(',')]).explode().value_counts()
-top_ingredients = ingredient_counts.head(25).index.tolist()
+# Data Processing
+UNKNOWN_PLACEHOLDER = "unknown" # Consistent naming
+TOP_N_INGREDIENTS = 20 # Number of top ingredients to consider for scenarios
 
+# Model Training & Evaluation
+KGE_MODEL = 'TuckER'
+EPOCHS = 200 # Keep moderate for reasonable training time, adjust as needed
+EARLY_STOPPING_PATIENCE = 5 # Example: Stop if no improvement after 5 epochs
+RANDOM_SEED = 42
+MAX_CRITERIA_COMBINATIONS = 8 # Evaluate scenarios from 1 to this number of criteria
+NUM_RANDOM_SAMPLES_PER_SIZE = 10000 # Reduced for faster testing, increase back to 25k/50k if needed
 
-from itertools import combinations, product
-import random
-
-# Set the random seed for reproducibility
-random.seed(42)
-
-# Extract the top 20 most common ingredients from 'best_foodentityname'
-ingredient_counts = recipes_df['best_foodentityname'].apply(lambda x: [ingredient.strip() for ingredient in x.split(',')]).explode().value_counts()
-top_ingredients = ingredient_counts.head(20).index.tolist()
-
-# Define relation options based on the columns in your dataset
-relation_options = {
-    "HasProteinLevel": ["low_protein", "medium_protein", "high_protein"],
-    "HasCarbLevel": ["low_carb", "medium_carb", "high_carb"],
-    "HasFatLevel": ["low_fat", "medium_fat", "high_fat"],
-    "HasFiberLevel": ["low_fiber", "medium_fiber", "high_fiber"],
-    "HasSodiumLevel": ["low_sodium", "medium_sodium", "high_sodium"],
-    "HasSugarLevel": ["low_sugar", "medium_sugar", "high_sugar"],
-    "HasCholesterolLevel": ["low_cholesterol", "medium_cholesterol", "high_cholesterol"],
-    "HasCalorieLevel": ["low_calorie", "medium_calorie", "high_calorie"],
-    "isForMealType": ["breakfast", "lunch", "dinner", "snack", "dessert", "starter", "brunch", "drink"],
-    "hasDietType": ["vegetarian", "vegan", "paleo", "standard"],
-    "isFromRegion": ["global", "asia", "north_america", "europe", "middle_east", "latin_america_and_caribbean", "oceania", "africa"],
-    "needTimeToCook": ["less_than_60_mins", "less_than_15_mins", "less_than_30_mins", "less_than_6_hours", "less_than_4_hours", "more_than_6_hours"],
-    "contains": top_ingredients
+# Mapping for relation names (more maintainable)
+RELATION_MAPPING = {
+    'ingredients': 'contains',
+    'diet_types': 'hasDietType',
+    'meal_type': 'isForMealType',
+    'cook_time': 'needTimeToCook',
+    'region_countries': 'isFromRegion',
+    'healthy_types': 'hasHealthAttribute' # Default for health types
 }
 
-# Function to generate test cases for specific combination size (binary or triple)
-def generate_specific_combinations(relation_options, combination_size):
+# Specific Health Relation Mapping (Case-insensitive prefixes)
+HEALTH_RELATION_PREFIX_MAP = {
+    'protein': 'HasProteinLevel',
+    'carb': 'HasCarbLevel',
+    'fat': 'HasFatLevel', # General fat
+    'saturated fat': 'HasSaturatedFatLevel', # Specific saturated fat
+    'calorie': 'HasCalorieLevel',
+    'sodium': 'HasSodiumLevel',
+    'sugar': 'HasSugarLevel',
+    'fiber': 'HasFiberLevel',
+    'cholesterol': 'HasCholesterolLevel',
+}
+
+# --- Logging Setup ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- Helper Functions ---
+
+def create_node_label(label: Any) -> str:
+    """
+    Cleans and standardizes a label to be used as a node name in the graph.
+    Handles potential non-string inputs and replaces problematic characters.
+    """
+    if pd.isna(label):
+        return UNKNOWN_PLACEHOLDER
+    label_str = str(label).strip().lower()
+    # Replace common problematic characters for node names/URIs
+    label_str = label_str.replace(" ", "_").replace("-", "_")
+    label_str = label_str.replace(">", "greater_than_").replace("<", "less_than_")
+    # Remove any other potentially invalid characters (adjust regex as needed)
+    # label_str = re.sub(r'[^\w_]', '', label_str) # Example: Keep only word chars and underscore
+    return label_str if label_str else UNKNOWN_PLACEHOLDER
+
+def safe_split_and_clean(data: Any, delimiter: str = ',') -> List[str]:
+    """Safely splits a string (if not NaN) and cleans each resulting label."""
+    if pd.isna(data):
+        return []
+    return [create_node_label(item.strip()) for item in str(data).split(delimiter) if item.strip()]
+
+def get_health_relation(health_type_label: str) -> str:
+    """Determines the specific relation type based on the health attribute label."""
+    health_type_lower = health_type_label.lower()
+    for prefix, relation in HEALTH_RELATION_PREFIX_MAP.items():
+        # Check if the label *starts* with the prefix (more specific)
+        # or just contains it if prefix matching is too strict
+        if health_type_lower.startswith(prefix) or prefix in health_type_lower:
+             # Handle cases like "low_saturated_fat" should map correctly
+            if prefix == 'fat' and 'saturated fat' in health_type_lower:
+                continue # Let 'saturated fat' handle this
+            return relation
+    # Fallback relation if no specific prefix matches
+    return RELATION_MAPPING['healthy_types']
+
+def load_and_preprocess_recipes(file_path: Path) -> pd.DataFrame:
+    """Loads recipe data, drops duplicates by name, and resets index."""
+    logging.info(f"Loading recipes from: {file_path}")
+    try:
+        df = pd.read_csv(file_path)
+        logging.info(f"Initial recipe count: {len(df)}")
+        df = df.drop_duplicates(subset='Name', keep='first').reset_index(drop=True)
+        logging.info(f"Recipe count after dropping duplicates: {len(df)}")
+        return df
+    except FileNotFoundError:
+        logging.error(f"Error: Input CSV file not found at {file_path}")
+        raise
+    except Exception as e:
+        logging.error(f"Error loading or preprocessing CSV: {e}")
+        raise
+
+def create_graph_and_triples(df: pd.DataFrame) -> Tuple[nx.Graph, np.ndarray]:
+    """
+    Processes the DataFrame to create a NetworkX graph and a NumPy array of triples.
+    """
+    logging.info("Creating graph and extracting triples...")
+    G = nx.Graph()
+    triples_list = []
+
+    required_columns = ['Name', 'best_foodentityname', 'Healthy_Type', 'meal_type', 'cook_time', 'Diet_Types', 'CleanedRegion']
+    if not all(col in df.columns for col in required_columns):
+        missing = [col for col in required_columns if col not in df.columns]
+        raise ValueError(f"Missing required columns in DataFrame: {missing}")
+
+    for _, row in df.iterrows():
+        recipe_name = create_node_label(row['Name'])
+        if recipe_name == UNKNOWN_PLACEHOLDER:
+            continue # Skip recipes with unknown names
+
+        G.add_node(recipe_name, type='recipe')
+
+        details = {
+            "ingredients": safe_split_and_clean(row['best_foodentityname']),
+            "diet_types": safe_split_and_clean(row.get('Diet_Types', '')), # Use .get for safety
+            "meal_type": safe_split_and_clean(row['meal_type']),
+            "cook_time": [create_node_label(row['cook_time'])], # Treat as list for consistency
+            "region_countries": safe_split_and_clean(row['CleanedRegion']),
+            "healthy_types": safe_split_and_clean(row['Healthy_Type']),
+        }
+
+        # Special handling for diet_types if it becomes empty after cleaning
+        if not details["diet_types"] and pd.notna(row.get('Diet_Types', '')):
+             # If original Diet_Types existed but cleaned to nothing, maybe add Unknown?
+             # Or decide based on requirements. Here, we add Unknown if it was specified.
+             if UNKNOWN_PLACEHOLDER in str(row.get('Diet_Types', '')).lower():
+                 details["diet_types"] = [UNKNOWN_PLACEHOLDER]
+
+
+        for relation_key, elements in details.items():
+            for element in elements:
+                if element == UNKNOWN_PLACEHOLDER or not element:
+                    continue # Skip unknown or empty elements
+
+                # Determine relation type
+                if relation_key == 'healthy_types':
+                    relation = get_health_relation(element)
+                    node_type = relation # Use the specific relation as node type
+                else:
+                    relation = RELATION_MAPPING.get(relation_key, 'hasAttribute') # Default relation
+                    node_type = relation_key # e.g., 'ingredients', 'diet_types'
+
+                # Add node and edge to graph
+                G.add_node(element, type=node_type)
+                G.add_edge(recipe_name, element, relation=relation)
+
+                # Add triple to list
+                triples_list.append((recipe_name, relation, element))
+
+    triples_array = np.array(triples_list, dtype=str)
+    logging.info(f"Graph created with {G.number_of_nodes()} nodes and {G.number_of_edges()} edges.")
+    logging.info(f"Extracted {len(triples_array)} triples.")
+    return G, triples_array
+
+def save_triples(triples_array: np.ndarray, output_path: Path):
+    """Saves the triples array to a CSV file."""
+    logging.info(f"Saving triples to: {output_path}")
+    triples_df = pd.DataFrame(triples_array, columns=['Head', 'Relation', 'Tail'])
+    triples_df.dropna(inplace=True) # Ensure no NaN rows are saved
+    triples_df.to_csv(output_path, index=False)
+    logging.info("Triples saved successfully.")
+
+def train_kge_model(triples_factory: TriplesFactory, model_name: str, epochs: int, results_dir: Path, early_stopping_patience: int) -> PipelineResult:
+    """Trains a KGE model using the PyKEEN pipeline."""
+    logging.info(f"Starting KGE model training (Model: {model_name}, Epochs: {epochs})...")
+
+    # Ensure results directory exists for model checkpointing etc.
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    # Use the same factory for training, validation, and testing as per original code
+    # Note: This means evaluation metrics reflect performance on the *training* data,
+    # which isn't standard practice for generalization assessment.
+    # For real-world evaluation, use triples_factory.split()
+    pipeline_kwargs = dict(
+        model=model_name,
+        training=triples_factory,
+        testing=triples_factory,
+        validation=triples_factory, # Using training data for validation too
+        training_kwargs=dict(num_epochs=epochs),
+        stopper='early',
+        stopper_kwargs=dict(
+            frequency=5, # Check every 5 epochs
+            patience=early_stopping_patience,
+            metric='hits@10', # Metric to monitor for early stopping
+            relative_delta=0.002 # Minimum improvement threshold
+            ),
+        evaluation_kwargs=dict(batch_size=128), # Adjust batch size as needed
+        random_seed=RANDOM_SEED,
+        # device='cuda' # Uncomment if GPU is available and configured
+    )
+
+    result = pipeline(**pipeline_kwargs)
+
+    logging.info("KGE model training completed.")
+    logging.info("--- Training Performance Metrics ---")
+    # Print key metrics (adjust which metrics are most important)
+    for metric in ['hits_at_1', 'hits_at_3', 'hits_at_10', 'mean_rank', 'mean_reciprocal_rank']:
+        try:
+            # Access metrics correctly (they might be nested under evaluation splits)
+            # Assuming evaluation on 'testing' set here which is same as training
+            metric_key_realistic = f'testing.realistic.{metric}'
+            metric_value = result.metric_results.get_metric(name=metric_key_realistic)
+            # Check if value is NaN or None before formatting
+            if pd.notna(metric_value):
+                 logging.info(f"{metric.replace('_', ' ').title()} (Realistic): {metric_value:.4f}")
+            else:
+                 logging.info(f"{metric.replace('_', ' ').title()} (Realistic): Not Available")
+
+        except KeyError:
+            logging.warning(f"Metric '{metric}' not found in results.")
+    logging.info("---------------------------------")
+
+    # Save the trained model and results
+    model_save_dir = results_dir / f"{model_name}_model"
+    result.save_to_directory(model_save_dir)
+    logging.info(f"Trained model and results saved to: {model_save_dir}")
+
+    return result
+
+def preprocess_dataframe_for_evaluation(df: pd.DataFrame) -> pd.DataFrame:
+    """Preprocesses the DataFrame specifically for evaluation filtering."""
+    logging.info("Preprocessing DataFrame for evaluation filtering...")
+    df_processed = df.copy()
+    # Apply cleaning consistent with triple generation
+    df_processed['Name'] = df_processed['Name'].apply(create_node_label)
+    # Clean columns used for filtering in evaluation
+    for col in ['Healthy_Type', 'meal_type', 'Diet_Types', 'CleanedRegion', 'best_foodentityname']:
+        # Apply safe_split_and_clean and join back, ensuring lowercase for consistency
+        df_processed[col] = df_processed[col].apply(lambda x: ','.join(sorted(safe_split_and_clean(x))))
+    df_processed['cook_time'] = df_processed['cook_time'].apply(create_node_label)
+    return df_processed
+
+def get_top_ingredients(df_processed: pd.DataFrame, n: int) -> List[str]:
+    """Extracts the top N most common ingredients from the processed DataFrame."""
+    logging.info(f"Determining top {n} ingredients...")
+    # Assumes 'best_foodentityname' is comma-separated cleaned ingredients
+    all_ingredients = df_processed['best_foodentityname'].str.split(',').explode()
+    # Filter out empty strings that might result from splitting
+    all_ingredients = all_ingredients[all_ingredients != '']
+    top_ingredients = all_ingredients.value_counts().head(n).index.tolist()
+    logging.info(f"Top {n} ingredients identified.")
+    return top_ingredients
+
+def define_relation_options(top_ingredients: List[str]) -> Dict[str, List[str]]:
+    """Defines the possible values for each relation type used in scenarios."""
+    return {
+        # Use the dynamically determined relation names from HEALTH_RELATION_PREFIX_MAP
+        **{relation: [f"{level}_{key.split('Has')[1].lower().replace('level','')}" for level in ['low', 'medium', 'high']]
+           for key, relation in HEALTH_RELATION_PREFIX_MAP.items()},
+        # Manually define options for other relations
+        RELATION_MAPPING['meal_type']: ["breakfast", "lunch", "dinner", "snack", "dessert", "starter", "brunch", "drink"],
+        RELATION_MAPPING['diet_types']: ["vegetarian", "vegan", "paleo", "standard"], # Make sure these match create_node_label output
+        RELATION_MAPPING['region_countries']: ["global", "asia", "north_america", "europe", "middle_east", "latin_america_and_caribbean", "oceania", "africa"],
+        RELATION_MAPPING['cook_time']: ["less_than_60_mins", "less_than_15_mins", "less_than_30_mins", "less_than_6_hours", "less_than_4_hours", "more_than_6_hours"],
+        RELATION_MAPPING['ingredients']: top_ingredients
+    }
+
+def generate_scenario_combinations(relation_options: Dict[str, List[str]], combination_size: int) -> List[List[Tuple[str, str]]]:
+    """Generates all possible combinations of criteria for a given size."""
     all_test_cases = []
-    relations = list(relation_options.items())
-    
-    for comb in combinations(relations, combination_size):
-        for values_comb in product(*[relation[1] for relation in comb]):
-            test_case = [(value, relation[0]) for value, relation in zip(values_comb, comb)]
+    # Use items() to get (relation_name, list_of_values) pairs
+    relations_with_values = list(relation_options.items())
+
+    # Check if combination_size is valid
+    if combination_size > len(relations_with_values) or combination_size < 1:
+        logging.warning(f"Combination size {combination_size} is invalid for {len(relations_with_values)} relation types. Skipping.")
+        return []
+
+    # Get combinations of relation types (e.g., ('hasDietType', 'isForMealType'))
+    for relation_comb in combinations(relations_with_values, combination_size):
+        # relation_comb is like: (('hasDietType', ['veg', 'vegan']), ('isForMealType', ['lunch', 'dinner']))
+        # Extract just the value lists: (['veg', 'vegan'], ['lunch', 'dinner'])
+        value_lists = [relation[1] for relation in relation_comb]
+
+        # Get product of values for the chosen relations (e.g., ('veg', 'lunch'), ('veg', 'dinner'), ...)
+        for values_tuple in product(*value_lists):
+            # values_tuple is like: ('veg', 'lunch')
+            # Zip it with the corresponding relation names from relation_comb
+            # relation_comb structure: ((relation_name1, values1), (relation_name2, values2))
+            test_case = list(zip(values_tuple, [relation[0] for relation in relation_comb]))
+            # test_case is like: [('veg', 'hasDietType'), ('lunch', 'isForMealType')]
             all_test_cases.append(test_case)
-    
+
     return all_test_cases
 
-# Generate binary combinations (pairs of criteria)
-three_criteria = generate_specific_combinations(relation_options, combination_size=4)
+def filter_recipes_for_scenario(df_processed: pd.DataFrame, scenario: List[Tuple[str, str]]) -> pd.DataFrame:
+    """Filters the DataFrame based on the criteria in a scenario."""
+    filtered_df = df_processed.copy()
+    # Dynamically map relations back to dataframe columns for filtering
+    column_mapping = {
+        RELATION_MAPPING['diet_types']: 'Diet_Types',
+        RELATION_MAPPING['meal_type']: 'meal_type',
+        RELATION_MAPPING['region_countries']: 'CleanedRegion',
+        RELATION_MAPPING['cook_time']: 'cook_time',
+        RELATION_MAPPING['ingredients']: 'best_foodentityname',
+        # Health relations all map to 'Healthy_Type' column
+        **{relation: 'Healthy_Type' for relation in HEALTH_RELATION_PREFIX_MAP.values()}
+    }
 
-# List of 5000 random samples from the generated three_criteria list
-random_4_user_criteria = random.choices(three_criteria, k=50000)
+    for value, relation in scenario:
+        if relation not in column_mapping:
+            logging.warning(f"Relation '{relation}' not found in column mapping for filtering. Skipping criterion.")
+            continue
 
-print(random_4_user_criteria)
+        column_to_filter = column_mapping[relation]
 
-# Display the first 20 combinations
-random_4_user_criteria[0:20]
+        if column_to_filter not in filtered_df.columns:
+             logging.warning(f"Column '{column_to_filter}' for relation '{relation}' not found in DataFrame. Skipping criterion.")
+             continue
+
+        # Apply filter: check if the cleaned 'value' string is present in the corresponding column
+        # Ensure case-insensitivity and handle comma-separated values correctly
+        # We check if the specific cleaned value is present as a whole word/item
+        # surrounded by commas or at the start/end of the string.
+        # Example: Searching for 'low_fat' in 'high_protein,low_fat,low_carb'
+        pattern = r'(?:^|,)' + pd.io.common.escape(value) + r'(?:,|$)'
+        try:
+            filtered_df = filtered_df[filtered_df[column_to_filter].str.contains(pattern, case=False, na=False, regex=True)]
+        except Exception as e:
+            logging.error(f"Error filtering column '{column_to_filter}' with value '{value}' using regex: {e}")
+            # Fallback to simpler contains check if regex fails (less accurate for substrings)
+            # filtered_df = filtered_df[filtered_df[column_to_filter].str.contains(value, case=False, na=False)]
+            return pd.DataFrame() # Return empty if filtering fails catastrophically
 
 
-test_scenarios = random_4_user_criteria
-def calculate_average_occurrence(scenarios, df):
-    total_count = 0  # Tüm senaryolar için toplam tarif sayısı
-    valid_scenario_count = 0  # Geçerli senaryoların sayısı
-    zero_scenarios = []  # Sıfır sonuç veren senaryoları tutacak liste
+    return filtered_df
 
-    # Her bir senaryo için döngü
-    for scenario in scenarios:
-        filter_condition = pd.Series([True] * len(df))  # Başlangıçta tüm satırlar dahil
-        
-        # Her bir kriter için filtre uygulama
-        for value, relation in scenario:
-            
-            if relation == "HasProteinLevel":
-                filter_condition &= df['Healthy_Type'].apply(lambda x: isinstance(x, str) and value in x.lower())
-            elif relation == "HasCarbLevel":
-                filter_condition &= df['Healthy_Type'].apply(lambda x: isinstance(x, str) and value in x.lower())
-            elif relation == "HasFatLevel":
-                filter_condition &= df['Healthy_Type'].apply(lambda x: isinstance(x, str) and value in x.lower())
-            elif relation == "HasFiberLevel":
-                filter_condition &= df['Healthy_Type'].apply(lambda x: isinstance(x, str) and value in x.lower())
-            elif relation == "HasSodiumLevel":
-                filter_condition &= df['Healthy_Type'].apply(lambda x: isinstance(x, str) and value in x.lower())
-            elif relation == "HasSugarLevel":
-                filter_condition &= df['Healthy_Type'].apply(lambda x: isinstance(x, str) and value in x.lower())
-            elif relation == "HasCholesterolLevel":
-                filter_condition &= df['Healthy_Type'].apply(lambda x: isinstance(x, str) and value in x.lower())
-            elif relation == "HasCalorieLevel":
-                filter_condition &= df['Healthy_Type'].apply(lambda x: isinstance(x, str) and value in x.lower())
-            elif relation == "isForMealType":
-                filter_condition &= df['meal_type'].apply(lambda x: isinstance(x, str) and value in x.lower())
-            elif relation == "hasDietType":
-                filter_condition &= df['Diet_Types'].apply(lambda x: isinstance(x, str) and value in x.lower())
-            elif relation == "isFromRegion":
-                filter_condition &= df['CleanedRegion'].apply(lambda x: isinstance(x, str) and value in x.lower())
-            elif relation == "needTimeToCook":
-                filter_condition &= df['cook_time'].apply(lambda x: isinstance(x, str) and value in x.lower())
-            elif relation == "contains":
-                filter_condition &= df['best_foodentityname'].apply(lambda x: isinstance(x, str) and value in x.lower())
-            
+def calculate_average_ground_truth_size(scenarios: List[List[Tuple[str, str]]], df_processed: pd.DataFrame) -> int:
+    """Calculates the average number of recipes matching the scenarios in the ground truth."""
+    logging.info(f"Calculating average ground truth size for {len(scenarios)} scenarios...")
+    total_count = 0
+    valid_scenario_count = 0
+    zero_result_scenarios = []
 
-        # Tüm filtreler uygulandıktan sonra, kalan satırların sayısını bul
-        count = df[filter_condition].shape[0]
-
-        # Eğer geçerli bir sayım varsa toplamı ve geçerli senaryo sayısını artırıyoruz
+    for i, scenario in enumerate(scenarios):
+        if (i + 1) % 1000 == 0: # Log progress
+             logging.debug(f"Processing scenario {i+1}/{len(scenarios)} for average size calculation...")
+        count = len(filter_recipes_for_scenario(df_processed, scenario))
         if count > 0:
             total_count += count
             valid_scenario_count += 1
         else:
-            zero_scenarios.append(scenario)  # Eğer sonuç sıfır ise senaryoyu kaydet
+            zero_result_scenarios.append(scenario)
 
-    # Ortalama hesaplama
-    if valid_scenario_count > 0:
-        average = total_count / valid_scenario_count
-    else:
-        average = 0  # Eğer geçerli kriter yoksa ortalama sıfırdır
+    if zero_result_scenarios:
+        logging.warning(f"{len(zero_result_scenarios)} scenarios resulted in 0 ground truth matches.")
+        # Optionally log the first few zero-result scenarios for debugging
+        # logging.debug("Example scenarios with 0 results:")
+        # for z in zero_result_scenarios[:5]:
+        #     logging.debug(z)
 
-    # Sıfır sonuç veren senaryoları yazdırma
-    if zero_scenarios:
-        print("\nScenarios with 0 results:")
-        for z in zero_scenarios:
-            print(z)
-    else:
-        print("\nNo scenarios returned 0 results.")
+    average = total_count / valid_scenario_count if valid_scenario_count > 0 else 0
+    logging.info(f"Average ground truth size (for non-zero scenarios): {average:.2f}")
+    # Return integer average as K for precision needs an integer
+    return max(1, int(round(average))) # Ensure K is at least 1
 
-    return average
-
-
-#import library 
-import networkx as nx
-import numpy as np
-from pykeen.pipeline import pipeline
-from pykeen.triples import TriplesFactory
-from sklearn.model_selection import train_test_split
-from sklearn.metrics.pairwise import cosine_similarity
-import pandas as pd
-from pykeen.hpo import hpo_pipeline
-
-
-# Load the CSV file
-file_path = '/app/BalancedRecipe_entity_linking.csv'
-recipes_df = pd.read_csv(file_path)
-recipes_df = recipes_df.drop_duplicates(subset='Name', keep='first')  # Ensure unique recipes
-recipes_df = recipes_df.reset_index(drop=True)  #
-
-UNKNOWN_PLACEHOLDER = 'Unknown'
-
-
-# Convert the dataframe into the required format for the graph
-
-recipes = process_recipes(recipes_df)
-
-# Process the recipes to create the graph and triples
-G, triples_array = create_graph_and_triples(recipes)
-
-
-# Convert the triples array into a pandas DataFrame
-triples_df = pd.DataFrame(triples_array, columns=['Head', 'Relation', 'Tail'])
-
-
-triples_df.to_csv('/app/recipes_triples_10000sample.csv',index=False)
-
-
-
-import pandas as pd 
-df=pd.read_csv('/app/recipes_triples_10000sample.csv')
-df=df.dropna()
-#df_filtered = df[df['Relation'] != 'contains']
-
-# Assuming df is your DataFrame
-triples = df[['Head', 'Relation', 'Tail']].values  # This returns a NumPy array directly
-
-# Create a TriplesFactory
-triples_factory = TriplesFactory.from_labeled_triples(triples)
-
-#training, testing, validation = triples_factory.split([7., .2, .1],randomize_cleanup=True)
-
-
-# Use the same triples_factory for both training and testing
-result = pipeline(
-    model='TuckER',
-    training=triples_factory,  # Use the entire triples factory for training
-    testing=triples_factory,   # Use the same factory for testing
-    validation=triples_factory,
-    epochs=200,
-    stopper='early',
-)
-
-print(f"Hits@1: {result.metric_results.get_metric('hits_at_1')}")
-print(f"Hits@3: {result.metric_results.get_metric('hits_at_3')}")
-print(f"Hits@10: {result.metric_results.get_metric('hits_at_10')}")
-print(f"Mean Rank (Realistic): {result.metric_results.get_metric('both.realistic.mean_rank')}")
-print(f"Mean Reciprocal Rank (Realistic): {result.metric_results.get_metric('both.realistic.mean_reciprocal_rank')}")
-
-
-
-
-import pandas as pd
-from pykeen.predict import predict_target
-from itertools import product
-
-# Load the data
-triples_df = pd.read_csv('/app/recipes_triples_10000sample.csv')
-file_path = '/app/BalancedRecipe_entity_linking.csv'
-recipes_df = pd.read_csv(file_path)
-recipes_df = recipes_df.drop_duplicates(subset='Name', keep='first')  # Ensure unique recipes
-recipes_df = recipes_df.reset_index(drop=True)
-
-
-# Process the dataframe
-recipes_df = process_recipes_dataframe(recipes_df)
-
-# Extract the top 50 most common ingredients from 'best_foodentityname'
-ingredient_counts = recipes_df['best_foodentityname'].apply(lambda x: [ingredient.strip() for ingredient in x.split(',')]).explode().value_counts()
-top_ingredients = ingredient_counts.head(25).index.tolist()
-
-from itertools import combinations, product
-
-# Extract the top 20 most common ingredients from 'best_foodentityname'
-ingredient_counts = recipes_df['best_foodentityname'].apply(lambda x: [ingredient.strip() for ingredient in x.split(',')]).explode().value_counts()
-top_ingredients = ingredient_counts.head(20).index.tolist()
-
-# Define relation options based on the columns in your dataset
-relation_options = {
-    "HasProteinLevel": ["low_protein", "medium_protein", "high_protein"],
-    "HasCarbLevel": ["low_carb", "medium_carb", "high_carb"],
-    "HasFatLevel": ["low_fat", "medium_fat", "high_fat"],
-    "HasFiberLevel": ["low_fiber", "medium_fiber", "high_fiber"],
-    "HasSodiumLevel": ["low_sodium", "medium_sodium", "high_sodium"],
-    "HasSugarLevel": ["low_sugar", "medium_sugar", "high_sugar"],
-    "HasCholesterolLevel": ["low_cholesterol", "medium_cholesterol", "high_cholesterol"],
-    "HasCalorieLevel": ["low_calorie", "medium_calorie", "high_calorie"],
-    "isForMealType": ["breakfast", "lunch", "dinner", "snack", "dessert", "starter", "brunch", "drink"],
-    "hasDietType": ["vegetarian", "vegan", "paleo", "standard"],
-    "isFromRegion": ["global", "asia", "north_america", "europe", "middle_east", "latin_america_and_caribbean", "oceania", "africa"],
-    "needTimeToCook": ["less_than_60_mins", "less_than_15_mins", "less_than_30_mins", "less_than_6_hours", "less_than_4_hours", "more_than_6_hours"],
-    "contains": top_ingredients
-
-}   
-
-# Generate binary combinations (pairs of criteria)
-one_criteria = generate_specific_combinations(relation_options, combination_size=1)
-
-test_scenarios = one_criteria
-
-
-# Sonucu hesapla
-average_occurrence = calculate_average_occurrence(test_scenarios, recipes_df)
-average_occurrence = int(average_occurrence)
-# Sonucu yazdırma
-print("\nAverage Occurrence for Scenarios:", average_occurrence)
-
-# Initialize a list to store test results
-test_results = []
-
-# Iterate through each test scenario
-for idx, scenario in enumerate(test_scenarios):
-    
-    filtered_recipes = recipes_df
-
-    for tail_entity, relation in scenario:
-        if relation == "hasDietType":
-            filtered_recipes = filtered_recipes[filtered_recipes['Diet_Types'].str.contains(tail_entity, case=False, na=False)]
-        elif relation == "isForMealType":
-            filtered_recipes = filtered_recipes[filtered_recipes['meal_type'].str.contains(tail_entity, case=False, na=False)]
-        elif relation == "isFromRegion":
-            filtered_recipes = filtered_recipes[filtered_recipes['CleanedRegion'].str.contains(tail_entity, case=False, na=False)]
-        elif relation == "needTimeToCook":
-            filtered_recipes = filtered_recipes[filtered_recipes['cook_time'].str.contains(tail_entity, case=False, na=False)]
-        elif relation in ["HasCarbLevel", "HasProteinLevel", "HasFatLevel", "HasFiberLevel", "HasSodiumLevel", "HasSugarLevel", "HasCholesterolLevel", "HasCalorieLevel"]:
-            filtered_recipes = filtered_recipes[filtered_recipes['Healthy_Type'].str.contains(tail_entity, case=False, na=False)]
-
-    expected_criteria_match_number = len(filtered_recipes)
-    # Skip the scenario if there are no matches
-    if expected_criteria_match_number == 0:
-        #print(f"Skipping Scenario {idx+1} as no relevant matches were found.")
-        continue
-    mean_count = average_occurrence
-
-    # Perform prediction using the model
+def predict_and_aggregate(model_result: PipelineResult, scenario: List[Tuple[str, str]]) -> pd.DataFrame:
+    """Gets predictions from the KGE model for a scenario and aggregates scores."""
     all_predictions = []
-    
     for tail_entity, relation in scenario:
-        predicted_heads = predict_target(
-            model=result.model,
-            relation=relation,
-            tail=tail_entity,
-            triples_factory=result.training
-        ).df
-        all_predictions.append(predicted_heads)
+        try:
+            predicted_heads = predict_target(
+                model=model_result.model,
+                relation=relation,
+                tail=tail_entity,
+                triples_factory=model_result.training # Use the factory the model was trained on
+            ).df
+            # Check if 'head_label' and 'score' columns exist
+            if 'head_label' not in predicted_heads.columns or 'score' not in predicted_heads.columns:
+                 logging.warning(f"Prediction for ({relation}, {tail_entity}) did not return 'head_label' or 'score'. Skipping.")
+                 continue
+            all_predictions.append(predicted_heads[['head_label', 'score']])
+        except Exception as e:
+            logging.error(f"Error during prediction for ({relation}, {tail_entity}): {e}")
+            continue # Skip this criterion if prediction fails
 
+    if not all_predictions:
+        return pd.DataFrame(columns=['head_label', 'total_score']) # Return empty if no predictions
+
+    # Concatenate and aggregate scores
     all_predictions_df = pd.concat(all_predictions, ignore_index=True)
     aggregated_predictions = all_predictions_df.groupby('head_label').agg(
         total_score=('score', 'sum')
     ).reset_index()
 
+    # Sort by aggregated score
     final_predictions_sorted = aggregated_predictions.sort_values(by="total_score", ascending=False)
+    return final_predictions_sorted
 
-    # Calculate Precision and Recall using the same Top N
-    top_n_scores = final_predictions_sorted["head_label"].head(mean_count)
-    matching_recipes = filtered_recipes[filtered_recipes['Name'].isin(top_n_scores)].drop_duplicates(subset='Name')
+def calculate_metrics(predicted_labels_top_k: Set[str],
+                      predicted_labels_top_relevant: Set[str],
+                      relevant_labels: Set[str],
+                      k_for_precision: int,
+                      num_relevant: int) -> Dict[str, float]:
+    """
+    Calculates Precision@K, Recall, F1 Score, and Accuracy@Relevant.
 
-    # Calculate sets of predicted and relevant recipes
-    predicted_recipes = set(top_n_scores)
-    relevant_recipes = set(filtered_recipes['Name'])
+    Args:
+        predicted_labels_top_k: Set of predicted recipe labels in the top K results (for Precision).
+        predicted_labels_top_relevant: Set of predicted recipe labels in the top 'num_relevant' results (for Accuracy).
+        relevant_labels: Set of actual relevant recipe labels (ground truth).
+        k_for_precision: The value K used for Precision calculation (average ground truth size).
+        num_relevant: The actual number of relevant recipes for this scenario.
 
-    # Calculate Precision and Recall using the same Top N
-    top_n_scores_accuracy = final_predictions_sorted["head_label"].head(expected_criteria_match_number)
-    matching_recipes_accuracy = filtered_recipes[filtered_recipes['Name'].isin(top_n_scores_accuracy)]
+    Returns:
+        A dictionary containing 'Precision', 'Recall', 'F1', 'Accuracy'.
+    """
+    # Intersection for Precision calculation (using top K predictions)
+    true_positives_at_k = predicted_labels_top_k.intersection(relevant_labels)
+    # Intersection for Recall and Accuracy calculation (using top N=num_relevant predictions)
+    true_positives_at_relevant = predicted_labels_top_relevant.intersection(relevant_labels)
 
-    true_positives = predicted_recipes.intersection(relevant_recipes)
-    precision = len(true_positives) / len(predicted_recipes) if len(predicted_recipes) > 0 else 0
-    # Recall Calculation
-    Recall = len(true_positives) / len(relevant_recipes) if len(relevant_recipes) > 0 else 0
+    # Precision@K
+    precision = len(true_positives_at_k) / k_for_precision if k_for_precision > 0 else 0.0
 
-    Accuracy = len(matching_recipes_accuracy) / expected_criteria_match_number if expected_criteria_match_number > 0 else 0
+    # Recall (based on all relevant items)
+    recall = len(true_positives_at_relevant) / num_relevant if num_relevant > 0 else 0.0 # Recall often uses intersection at K too, depends on definition. Let's use intersection at N=num_relevant here as it reflects if *all* relevant items could be found within the top N predictions. If recall should be @K, use true_positives_at_k.
+
+    # F1 Score
+    f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+
+    # Accuracy@N (where N = num_relevant) - How many of the top N predictions were actually relevant?
+    # This is essentially Precision@N where N=num_relevant
+    accuracy = len(true_positives_at_relevant) / num_relevant if num_relevant > 0 else 0.0
 
 
-    # Precision Calculation
-    predicted_recipes = set(top_n_scores)
-    relevant_recipes = set(filtered_recipes['Name'])
-
-
-    # F1 Score Calculation
-    if precision + Recall > 0:
-        F1 = 2 * (precision * Recall) / (precision + Recall)
-    else:
-        F1 = 0
-
-    # Store results
-    result_dict = {
-        "Scenario": idx + 1,
-        "Criteria": scenario,
-        "Expected Matches For Recall": expected_criteria_match_number,
-        "Predicted Matches (Recall)": len(matching_recipes),
-        "Recall": Recall,
-        "Expected Matches For Precision": mean_count,
-        "Predicted Matches (Precision)": len(matching_recipes),
+    return {
         "Precision": precision,
-        "F1 Score": F1,  # Add F1 Score to results,
-        "Expected Matched For Accuracy":expected_criteria_match_number,
-        "Predicted Matched (Accuracy)":len(matching_recipes_accuracy),
-        "Accuracy":Accuracy
+        "Recall": recall,
+        "F1 Score": f1,
+        "Accuracy": accuracy,
+        "TruePositives@K": len(true_positives_at_k),
+        "TruePositives@Relevant": len(true_positives_at_relevant)
     }
-    
-    test_results.append(result_dict)
-
-# Convert results into DataFrame
-results_df = pd.DataFrame(test_results)
-#nohup python3 TuckER.py > output.log
-# Display the results
-#results_df
 
 
-results_df.to_csv('/app/TuckEREvulationResults/one_criteria_TuckER.csv',index=False)
+def evaluate_scenarios(
+    model_result: PipelineResult,
+    recipes_df_processed: pd.DataFrame,
+    relation_options: Dict[str, List[str]],
+    combination_size: int,
+    num_samples: int,
+    results_dir: Path
+):
+    """Generates scenarios, runs predictions, calculates metrics, and saves results."""
+    logging.info(f"--- Starting Evaluation for Combination Size: {combination_size} ---")
 
-from itertools import combinations, product
+    output_filename = results_dir / f"{combination_size}_criteria_{KGE_MODEL}.csv"
+    if output_filename.exists():
+        logging.warning(f"Output file {output_filename} already exists. Skipping evaluation for size {combination_size}.")
+        # return # Uncomment this line if you want to strictly avoid re-running
 
-# Extract the top 20 most common ingredients from 'best_foodentityname'
-ingredient_counts = recipes_df['best_foodentityname'].apply(lambda x: [ingredient.strip() for ingredient in x.split(',')]).explode().value_counts()
-top_ingredients = ingredient_counts.head(20).index.tolist()
+    # 1. Generate all possible combinations for the size
+    all_combinations = generate_scenario_combinations(relation_options, combination_size)
+    if not all_combinations:
+        logging.warning(f"No combinations generated for size {combination_size}. Skipping evaluation.")
+        return
 
-# Define relation options based on the columns in your dataset
-relation_options = {
-    "HasProteinLevel": ["low_protein", "medium_protein", "high_protein"],
-    "HasCarbLevel": ["low_carb", "medium_carb", "high_carb"],
-    "HasFatLevel": ["low_fat", "medium_fat", "high_fat"],
-    "HasFiberLevel": ["low_fiber", "medium_fiber", "high_fiber"],
-    "HasSodiumLevel": ["low_sodium", "medium_sodium", "high_sodium"],
-    "HasSugarLevel": ["low_sugar", "medium_sugar", "high_sugar"],
-    "HasCholesterolLevel": ["low_cholesterol", "medium_cholesterol", "high_cholesterol"],
-    "HasCalorieLevel": ["low_calorie", "medium_calorie", "high_calorie"],
-    "isForMealType": ["breakfast", "lunch", "dinner", "snack", "dessert", "starter", "brunch", "drink"],
-    "hasDietType": ["vegetarian", "vegan", "paleo", "standard"],
-    "isFromRegion": ["global", "asia", "north_america", "europe", "middle_east", "latin_america_and_caribbean", "oceania", "africa"],
-    "needTimeToCook": ["less_than_60_mins", "less_than_15_mins", "less_than_30_mins", "less_than_6_hours", "less_than_4_hours", "more_than_6_hours"],
-    "contains": top_ingredients
+    logging.info(f"Generated {len(all_combinations)} total combinations for size {combination_size}.")
 
-}   
-
-# Generate binary combinations (pairs of criteria)
-two_criteria = generate_specific_combinations(relation_options, combination_size=2)
-
-
-test_scenarios = two_criteria
-
-# Sonucu hesapla
-average_occurrence = calculate_average_occurrence(test_scenarios, recipes_df)
-average_occurrence = int(average_occurrence)
-# Sonucu yazdırma
-print("\nAverage Occurrence for Scenarios:", average_occurrence)
-
-# Initialize a list to store test results
-test_results = []
-
-# Iterate through each test scenario
-for idx, scenario in enumerate(test_scenarios):
-    
-    filtered_recipes = recipes_df
-
-    for tail_entity, relation in scenario:
-        if relation == "hasDietType":
-            filtered_recipes = filtered_recipes[filtered_recipes['Diet_Types'].str.contains(tail_entity, case=False, na=False)]
-        elif relation == "isForMealType":
-            filtered_recipes = filtered_recipes[filtered_recipes['meal_type'].str.contains(tail_entity, case=False, na=False)]
-        elif relation == "isFromRegion":
-            filtered_recipes = filtered_recipes[filtered_recipes['CleanedRegion'].str.contains(tail_entity, case=False, na=False)]
-        elif relation == "needTimeToCook":
-            filtered_recipes = filtered_recipes[filtered_recipes['cook_time'].str.contains(tail_entity, case=False, na=False)]
-        elif relation in ["HasCarbLevel", "HasProteinLevel", "HasFatLevel", "HasFiberLevel", "HasSodiumLevel", "HasSugarLevel", "HasCholesterolLevel", "HasCalorieLevel"]:
-            filtered_recipes = filtered_recipes[filtered_recipes['Healthy_Type'].str.contains(tail_entity, case=False, na=False)]
-
-    expected_criteria_match_number = len(filtered_recipes)
-    # Skip the scenario if there are no matches
-    if expected_criteria_match_number == 0:
-        #print(f"Skipping Scenario {idx+1} as no relevant matches were found.")
-        continue
-    mean_count = average_occurrence
-
-    # Perform prediction using the model
-    all_predictions = []
-    
-    for tail_entity, relation in scenario:
-        predicted_heads = predict_target(
-            model=result.model,
-            relation=relation,
-            tail=tail_entity,
-            triples_factory=result.training
-        ).df
-        all_predictions.append(predicted_heads)
-
-    all_predictions_df = pd.concat(all_predictions, ignore_index=True)
-    aggregated_predictions = all_predictions_df.groupby('head_label').agg(
-        total_score=('score', 'sum')
-    ).reset_index()
-
-    final_predictions_sorted = aggregated_predictions.sort_values(by="total_score", ascending=False)
-
-    # Calculate Precision and Recall using the same Top N
-    top_n_scores = final_predictions_sorted["head_label"].head(mean_count)
-    matching_recipes = filtered_recipes[filtered_recipes['Name'].isin(top_n_scores)].drop_duplicates(subset='Name')
-
-    # Calculate sets of predicted and relevant recipes
-    predicted_recipes = set(top_n_scores)
-    relevant_recipes = set(filtered_recipes['Name'])
-
-    # Calculate Precision and Recall using the same Top N
-    top_n_scores_accuracy = final_predictions_sorted["head_label"].head(expected_criteria_match_number)
-    matching_recipes_accuracy = filtered_recipes[filtered_recipes['Name'].isin(top_n_scores_accuracy)]
-
-    true_positives = predicted_recipes.intersection(relevant_recipes)
-    precision = len(true_positives) / len(predicted_recipes) if len(predicted_recipes) > 0 else 0
-    # Recall Calculation
-    Recall = len(true_positives) / len(relevant_recipes) if len(relevant_recipes) > 0 else 0
-
-    Accuracy = len(matching_recipes_accuracy) / expected_criteria_match_number if expected_criteria_match_number > 0 else 0
-
-
-    # Precision Calculation
-    predicted_recipes = set(top_n_scores)
-    relevant_recipes = set(filtered_recipes['Name'])
-
-
-    # F1 Score Calculation
-    if precision + Recall > 0:
-        F1 = 2 * (precision * Recall) / (precision + Recall)
+    # 2. Sample a subset of scenarios if needed
+    if len(all_combinations) > num_samples:
+        logging.info(f"Sampling {num_samples} random scenarios from the total combinations.")
+        random.seed(RANDOM_SEED) # Ensure reproducibility of sampling
+        test_scenarios = random.sample(all_combinations, num_samples)
     else:
-        F1 = 0
+        logging.info("Using all generated combinations as test scenarios.")
+        test_scenarios = all_combinations
 
-    # Store results
-    result_dict = {
-        "Scenario": idx + 1,
-        "Criteria": scenario,
-        "Expected Matches For Recall": expected_criteria_match_number,
-        "Predicted Matches (Recall)": len(matching_recipes),
-        "Recall": Recall,
-        "Expected Matches For Precision": mean_count,
-        "Predicted Matches (Precision)": len(matching_recipes),
-        "Precision": precision,
-        "F1 Score": F1,  # Add F1 Score to results,
-        "Expected Matched For Accuracy":expected_criteria_match_number,
-        "Predicted Matched (Accuracy)":len(matching_recipes_accuracy),
-        "Accuracy":Accuracy
-    }
-    
-    test_results.append(result_dict)
+    # 3. Calculate average ground truth size (K for Precision)
+    # Use the *sampled* scenarios for calculating K if sampling was done
+    k_for_precision = calculate_average_ground_truth_size(test_scenarios, recipes_df_processed)
+    logging.info(f"Using K = {k_for_precision} for Precision calculation.")
 
-# Convert results into DataFrame
-results_df = pd.DataFrame(test_results)
+    # 4. Iterate through scenarios, predict, and evaluate
+    test_results = []
+    evaluated_count = 0
+    skipped_count = 0
 
+    for idx, scenario in enumerate(test_scenarios):
+        if (idx + 1) % (len(test_scenarios)//10 or 1) == 0: # Log progress roughly every 10%
+            logging.info(f"Evaluating scenario {idx+1}/{len(test_scenarios)} (Size {combination_size})...")
 
-results_df.to_csv('/app/TuckEREvulationResults/two_criteria_TuckER.csv',index=False)
+        # Get ground truth relevant recipes
+        relevant_recipes_df = filter_recipes_for_scenario(recipes_df_processed, scenario)
+        relevant_recipe_labels = set(relevant_recipes_df['Name'])
+        actual_num_relevant = len(relevant_recipe_labels)
 
+        if actual_num_relevant == 0:
+            # logging.debug(f"Skipping Scenario {idx+1} (Size {combination_size}) as ground truth is empty.")
+            skipped_count += 1
+            continue
 
-from itertools import combinations, product
-import random
-
-# Set the random seed for reproducibility
-random.seed(42)
-
-# Extract the top 20 most common ingredients from 'best_foodentityname'
-ingredient_counts = recipes_df['best_foodentityname'].apply(lambda x: [ingredient.strip() for ingredient in x.split(',')]).explode().value_counts()
-top_ingredients = ingredient_counts.head(20).index.tolist()
-
-# Define relation options based on the columns in your dataset
-relation_options = {
-    "HasProteinLevel": ["low_protein", "medium_protein", "high_protein"],
-    "HasCarbLevel": ["low_carb", "medium_carb", "high_carb"],
-    "HasFatLevel": ["low_fat", "medium_fat", "high_fat"],
-    "HasFiberLevel": ["low_fiber", "medium_fiber", "high_fiber"],
-    "HasSodiumLevel": ["low_sodium", "medium_sodium", "high_sodium"],
-    "HasSugarLevel": ["low_sugar", "medium_sugar", "high_sugar"],
-    "HasCholesterolLevel": ["low_cholesterol", "medium_cholesterol", "high_cholesterol"],
-    "HasCalorieLevel": ["low_calorie", "medium_calorie", "high_calorie"],
-    "isForMealType": ["breakfast", "lunch", "dinner", "snack", "dessert", "starter", "brunch", "drink"],
-    "hasDietType": ["vegetarian", "vegan", "paleo", "standard"],
-    "isFromRegion": ["global", "asia", "north_america", "europe", "middle_east", "latin_america_and_caribbean", "oceania", "africa"],
-    "needTimeToCook": ["less_than_60_mins", "less_than_15_mins", "less_than_30_mins", "less_than_6_hours", "less_than_4_hours", "more_than_6_hours"],
-    "contains": top_ingredients
-}
-
-# Generate binary combinations (pairs of criteria)
-three_criteria = generate_specific_combinations(relation_options, combination_size=3)
-
-# List of 5000 random samples from the generated three_criteria list
-random_3_user_criteria = random.choices(three_criteria, k=25000)
-
-print(random_3_user_criteria)
-
-# Display the first 20 combinations
-random_3_user_criteria[0:20]
+        # Get model predictions
+        predictions_df = predict_and_aggregate(model_result, scenario)
+        if predictions_df.empty:
+            logging.warning(f"No predictions generated for Scenario {idx+1} (Size {combination_size}). Skipping.")
+            skipped_count +=1
+            continue
 
 
-test_scenarios = random_3_user_criteria
-# Sonucu hesapla
-average_occurrence = calculate_average_occurrence(test_scenarios, recipes_df)
-average_occurrence = int(average_occurrence)
-# Sonucu yazdırma
-print("\nAverage Occurrence for Scenarios:", average_occurrence)
+        # Get top K predicted labels (for Precision@K)
+        predicted_labels_top_k = set(predictions_df['head_label'].head(k_for_precision))
 
-# Initialize a list to store test results
-test_results = []
+        # Get top N=num_relevant predicted labels (for Recall/Accuracy@N)
+        predicted_labels_top_relevant = set(predictions_df['head_label'].head(actual_num_relevant))
 
-# Iterate through each test scenario
-for idx, scenario in enumerate(test_scenarios):
-    
-    filtered_recipes = recipes_df
+        # Calculate metrics
+        metrics = calculate_metrics(
+            predicted_labels_top_k,
+            predicted_labels_top_relevant,
+            relevant_recipe_labels,
+            k_for_precision,
+            actual_num_relevant
+        )
 
-    for tail_entity, relation in scenario:
-        if relation == "hasDietType":
-            filtered_recipes = filtered_recipes[filtered_recipes['Diet_Types'].str.contains(tail_entity, case=False, na=False)]
-        elif relation == "isForMealType":
-            filtered_recipes = filtered_recipes[filtered_recipes['meal_type'].str.contains(tail_entity, case=False, na=False)]
-        elif relation == "isFromRegion":
-            filtered_recipes = filtered_recipes[filtered_recipes['CleanedRegion'].str.contains(tail_entity, case=False, na=False)]
-        elif relation == "needTimeToCook":
-            filtered_recipes = filtered_recipes[filtered_recipes['cook_time'].str.contains(tail_entity, case=False, na=False)]
-        elif relation in ["HasCarbLevel", "HasProteinLevel", "HasFatLevel", "HasFiberLevel", "HasSodiumLevel", "HasSugarLevel", "HasCholesterolLevel", "HasCalorieLevel"]:
-            filtered_recipes = filtered_recipes[filtered_recipes['Healthy_Type'].str.contains(tail_entity, case=False, na=False)]
-
-    expected_criteria_match_number = len(filtered_recipes)
-    # Skip the scenario if there are no matches
-    if expected_criteria_match_number == 0:
-        #print(f"Skipping Scenario {idx+1} as no relevant matches were found.")
-        continue
-    mean_count = average_occurrence
-
-    # Perform prediction using the model
-    all_predictions = []
-    
-    for tail_entity, relation in scenario:
-        predicted_heads = predict_target(
-            model=result.model,
-            relation=relation,
-            tail=tail_entity,
-            triples_factory=result.training
-        ).df
-        all_predictions.append(predicted_heads)
-
-    all_predictions_df = pd.concat(all_predictions, ignore_index=True)
-    aggregated_predictions = all_predictions_df.groupby('head_label').agg(
-        total_score=('score', 'sum')
-    ).reset_index()
-
-    final_predictions_sorted = aggregated_predictions.sort_values(by="total_score", ascending=False)
-
-    # Calculate Precision and Recall using the same Top N
-    top_n_scores = final_predictions_sorted["head_label"].head(mean_count)
-    matching_recipes = filtered_recipes[filtered_recipes['Name'].isin(top_n_scores)].drop_duplicates(subset='Name')
-
-    # Calculate sets of predicted and relevant recipes
-    predicted_recipes = set(top_n_scores)
-    relevant_recipes = set(filtered_recipes['Name'])
-
-    # Calculate Precision and Recall using the same Top N
-    top_n_scores_accuracy = final_predictions_sorted["head_label"].head(expected_criteria_match_number)
-    matching_recipes_accuracy = filtered_recipes[filtered_recipes['Name'].isin(top_n_scores_accuracy)]
-
-    true_positives = predicted_recipes.intersection(relevant_recipes)
-    precision = len(true_positives) / len(predicted_recipes) if len(predicted_recipes) > 0 else 0
-    # Recall Calculation
-    Recall = len(true_positives) / len(relevant_recipes) if len(relevant_recipes) > 0 else 0
-
-    Accuracy = len(matching_recipes_accuracy) / expected_criteria_match_number if expected_criteria_match_number > 0 else 0
+        # Store results
+        result_dict = {
+            "Scenario_Index": idx + 1,
+            "Combination_Size": combination_size,
+            "Criteria": str(scenario), # Store scenario as string for CSV
+            "GroundTruth_Size (N)": actual_num_relevant,
+            "K_for_Precision": k_for_precision,
+            "Precision_at_K": metrics["Precision"],
+            "Recall_at_N": metrics["Recall"],
+            "F1_Score": metrics["F1 Score"],
+            "Accuracy_at_N": metrics["Accuracy"],
+            "Predicted_Count_TopK": len(predicted_labels_top_k),
+            "Predicted_Count_TopN": len(predicted_labels_top_relevant),
+            "TP_at_K": metrics["TruePositives@K"],
+            "TP_at_N": metrics["TruePositives@Relevant"],
+        }
+        test_results.append(result_dict)
+        evaluated_count += 1
 
 
-    # Precision Calculation
-    predicted_recipes = set(top_n_scores)
-    relevant_recipes = set(filtered_recipes['Name'])
+    logging.info(f"Finished evaluation for size {combination_size}.")
+    logging.info(f"Evaluated: {evaluated_count}, Skipped (0 ground truth or prediction errors): {skipped_count}")
 
 
-    # F1 Score Calculation
-    if precision + Recall > 0:
-        F1 = 2 * (precision * Recall) / (precision + Recall)
+    # 5. Save results to CSV
+    if test_results:
+        results_df = pd.DataFrame(test_results)
+        results_df.to_csv(output_filename, index=False)
+        logging.info(f"Results for size {combination_size} saved to {output_filename}")
+
+        # Log average metrics for this size
+        avg_precision = results_df["Precision_at_K"].mean()
+        avg_recall = results_df["Recall_at_N"].mean()
+        avg_f1 = results_df["F1_Score"].mean()
+        avg_accuracy = results_df["Accuracy_at_N"].mean()
+        logging.info(f"Average Metrics (Size {combination_size}): "
+                     f"Precision@{k_for_precision}={avg_precision:.4f}, "
+                     f"Recall@{k_for_precision}={avg_recall:.4f}, " # Note: Recall was calculated @N, rename log message if needed
+                     f"F1={avg_f1:.4f}, "
+                     f"Accuracy@N={avg_accuracy:.4f}")
     else:
-        F1 = 0
-
-    # Store results
-    result_dict = {
-        "Scenario": idx + 1,
-        "Criteria": scenario,
-        "Expected Matches For Recall": expected_criteria_match_number,
-        "Predicted Matches (Recall)": len(matching_recipes),
-        "Recall": Recall,
-        "Expected Matches For Precision": mean_count,
-        "Predicted Matches (Precision)": len(matching_recipes),
-        "Precision": precision,
-        "F1 Score": F1,  # Add F1 Score to results,
-        "Expected Matched For Accuracy":expected_criteria_match_number,
-        "Predicted Matched (Accuracy)":len(matching_recipes_accuracy),
-        "Accuracy":Accuracy
-    }
-    
-    test_results.append(result_dict)
-
-# Convert results into DataFrame
-results_df = pd.DataFrame(test_results)
-
-results_df.to_csv('/app/TuckEREvulationResults/three_criteria_TuckER.csv',index=False)
-
-from itertools import combinations, product
-import random
-
-# Set the random seed for reproducibility
-random.seed(42)
-
-# Extract the top 20 most common ingredients from 'best_foodentityname'
-ingredient_counts = recipes_df['best_foodentityname'].apply(lambda x: [ingredient.strip() for ingredient in x.split(',')]).explode().value_counts()
-top_ingredients = ingredient_counts.head(20).index.tolist()
-
-# Define relation options based on the columns in your dataset
-relation_options = {
-    "HasProteinLevel": ["low_protein", "medium_protein", "high_protein"],
-    "HasCarbLevel": ["low_carb", "medium_carb", "high_carb"],
-    "HasFatLevel": ["low_fat", "medium_fat", "high_fat"],
-    "HasFiberLevel": ["low_fiber", "medium_fiber", "high_fiber"],
-    "HasSodiumLevel": ["low_sodium", "medium_sodium", "high_sodium"],
-    "HasSugarLevel": ["low_sugar", "medium_sugar", "high_sugar"],
-    "HasCholesterolLevel": ["low_cholesterol", "medium_cholesterol", "high_cholesterol"],
-    "HasCalorieLevel": ["low_calorie", "medium_calorie", "high_calorie"],
-    "isForMealType": ["breakfast", "lunch", "dinner", "snack", "dessert", "starter", "brunch", "drink"],
-    "hasDietType": ["vegetarian", "vegan", "paleo", "standard"],
-    "isFromRegion": ["global", "asia", "north_america", "europe", "middle_east", "latin_america_and_caribbean", "oceania", "africa"],
-    "needTimeToCook": ["less_than_60_mins", "less_than_15_mins", "less_than_30_mins", "less_than_6_hours", "less_than_4_hours", "more_than_6_hours"],
-    "contains": top_ingredients
-}
-
-
-# Generate binary combinations (pairs of criteria)
-four_criteria = generate_specific_combinations(relation_options, combination_size=4)
-
-# List of 5000 random samples from the generated three_criteria list
-random_4_user_criteria = random.choices(four_criteria, k=50000)
-
-print(random_4_user_criteria)
-
-# Display the first 20 combinations
-random_4_user_criteria[0:20]
-
-test_scenarios = random_4_user_criteria
-# Function to calculate co-occurrence
-
-# Sonucu hesapla
-average_occurrence = calculate_average_occurrence(test_scenarios, recipes_df)
-average_occurrence = int(average_occurrence)
-# Sonucu yazdırma
-print("\nAverage Occurrence for Scenarios:", average_occurrence)
-
-# Initialize a list to store test results
-test_results = []
-
-# Iterate through each test scenario
-for idx, scenario in enumerate(test_scenarios):
-    
-    filtered_recipes = recipes_df
-
-    for tail_entity, relation in scenario:
-        if relation == "hasDietType":
-            filtered_recipes = filtered_recipes[filtered_recipes['Diet_Types'].str.contains(tail_entity, case=False, na=False)]
-        elif relation == "isForMealType":
-            filtered_recipes = filtered_recipes[filtered_recipes['meal_type'].str.contains(tail_entity, case=False, na=False)]
-        elif relation == "isFromRegion":
-            filtered_recipes = filtered_recipes[filtered_recipes['CleanedRegion'].str.contains(tail_entity, case=False, na=False)]
-        elif relation == "needTimeToCook":
-            filtered_recipes = filtered_recipes[filtered_recipes['cook_time'].str.contains(tail_entity, case=False, na=False)]
-        elif relation in ["HasCarbLevel", "HasProteinLevel", "HasFatLevel", "HasFiberLevel", "HasSodiumLevel", "HasSugarLevel", "HasCholesterolLevel", "HasCalorieLevel"]:
-            filtered_recipes = filtered_recipes[filtered_recipes['Healthy_Type'].str.contains(tail_entity, case=False, na=False)]
-
-    expected_criteria_match_number = len(filtered_recipes)
-    # Skip the scenario if there are no matches
-    if expected_criteria_match_number == 0:
-        #print(f"Skipping Scenario {idx+1} as no relevant matches were found.")
-        continue
-    mean_count = average_occurrence
-
-    # Perform prediction using the model
-    all_predictions = []
-    
-    for tail_entity, relation in scenario:
-        predicted_heads = predict_target(
-            model=result.model,
-            relation=relation,
-            tail=tail_entity,
-            triples_factory=result.training
-        ).df
-        all_predictions.append(predicted_heads)
-
-    all_predictions_df = pd.concat(all_predictions, ignore_index=True)
-    aggregated_predictions = all_predictions_df.groupby('head_label').agg(
-        total_score=('score', 'sum')
-    ).reset_index()
-
-    final_predictions_sorted = aggregated_predictions.sort_values(by="total_score", ascending=False)
-
-    # Calculate Precision and Recall using the same Top N
-    top_n_scores = final_predictions_sorted["head_label"].head(mean_count)
-    matching_recipes = filtered_recipes[filtered_recipes['Name'].isin(top_n_scores)].drop_duplicates(subset='Name')
-
-    # Calculate sets of predicted and relevant recipes
-    predicted_recipes = set(top_n_scores)
-    relevant_recipes = set(filtered_recipes['Name'])
-
-    # Calculate Precision and Recall using the same Top N
-    top_n_scores_accuracy = final_predictions_sorted["head_label"].head(expected_criteria_match_number)
-    matching_recipes_accuracy = filtered_recipes[filtered_recipes['Name'].isin(top_n_scores_accuracy)]
-
-    true_positives = predicted_recipes.intersection(relevant_recipes)
-    precision = len(true_positives) / len(predicted_recipes) if len(predicted_recipes) > 0 else 0
-    # Recall Calculation
-    Recall = len(true_positives) / len(relevant_recipes) if len(relevant_recipes) > 0 else 0
-
-    Accuracy = len(matching_recipes_accuracy) / expected_criteria_match_number if expected_criteria_match_number > 0 else 0
-
-
-    # Precision Calculation
-    predicted_recipes = set(top_n_scores)
-    relevant_recipes = set(filtered_recipes['Name'])
-
-
-    # F1 Score Calculation
-    if precision + Recall > 0:
-        F1 = 2 * (precision * Recall) / (precision + Recall)
-    else:
-        F1 = 0
-
-    # Store results
-    result_dict = {
-        "Scenario": idx + 1,
-        "Criteria": scenario,
-        "Expected Matches For Recall": expected_criteria_match_number,
-        "Predicted Matches (Recall)": len(matching_recipes),
-        "Recall": Recall,
-        "Expected Matches For Precision": mean_count,
-        "Predicted Matches (Precision)": len(matching_recipes),
-        "Precision": precision,
-        "F1 Score": F1,  # Add F1 Score to results,
-        "Expected Matched For Accuracy":expected_criteria_match_number,
-        "Predicted Matched (Accuracy)":len(matching_recipes_accuracy),
-        "Accuracy":Accuracy
-    }
-    
-    test_results.append(result_dict)
-
-# Convert results into DataFrame
-results_df = pd.DataFrame(test_results)
-
-results_df.to_csv('/app/TuckEREvulationResults/four_criteria_TuckER.csv',index=False)
-
-from itertools import combinations, product
-import random
-
-# Set the random seed for reproducibility
-random.seed(42)
-
-# Extract the top 20 most common ingredients from 'best_foodentityname'
-ingredient_counts = recipes_df['best_foodentityname'].apply(lambda x: [ingredient.strip() for ingredient in x.split(',')]).explode().value_counts()
-top_ingredients = ingredient_counts.head(20).index.tolist()
-
-# Define relation options based on the columns in your dataset
-relation_options = {
-    "HasProteinLevel": ["low_protein", "medium_protein", "high_protein"],
-    "HasCarbLevel": ["low_carb", "medium_carb", "high_carb"],
-    "HasFatLevel": ["low_fat", "medium_fat", "high_fat"],
-    "HasFiberLevel": ["low_fiber", "medium_fiber", "high_fiber"],
-    "HasSodiumLevel": ["low_sodium", "medium_sodium", "high_sodium"],
-    "HasSugarLevel": ["low_sugar", "medium_sugar", "high_sugar"],
-    "HasCholesterolLevel": ["low_cholesterol", "medium_cholesterol", "high_cholesterol"],
-    "HasCalorieLevel": ["low_calorie", "medium_calorie", "high_calorie"],
-    "isForMealType": ["breakfast", "lunch", "dinner", "snack", "dessert", "starter", "brunch", "drink"],
-    "hasDietType": ["vegetarian", "vegan", "paleo", "standard"],
-    "isFromRegion": ["global", "asia", "north_america", "europe", "middle_east", "latin_america_and_caribbean", "oceania", "africa"],
-    "needTimeToCook": ["less_than_60_mins", "less_than_15_mins", "less_than_30_mins", "less_than_6_hours", "less_than_4_hours", "more_than_6_hours"],
-    "contains": top_ingredients
-}
-
-# Generate binary combinations (pairs of criteria)
-three_criteria = generate_specific_combinations(relation_options, combination_size=5)
-
-# List of 5000 random samples from the generated three_criteria list
-random_5_user_criteria = random.choices(three_criteria, k=50000)
-
-print(random_5_user_criteria)
-
-# Display the first 20 combinations
-random_5_user_criteria[0:20]
-
-test_scenarios = random_5_user_criteria
-
-# Sonucu hesapla
-average_occurrence = calculate_average_occurrence(test_scenarios, recipes_df)
-average_occurrence = int(average_occurrence)
-# Sonucu yazdırma
-print("\nAverage Occurrence for Scenarios:", average_occurrence)
-
-# Initialize a list to store test results
-test_results = []
-
-# Iterate through each test scenario
-for idx, scenario in enumerate(test_scenarios):
-    
-    filtered_recipes = recipes_df
-
-    for tail_entity, relation in scenario:
-        if relation == "hasDietType":
-            filtered_recipes = filtered_recipes[filtered_recipes['Diet_Types'].str.contains(tail_entity, case=False, na=False)]
-        elif relation == "isForMealType":
-            filtered_recipes = filtered_recipes[filtered_recipes['meal_type'].str.contains(tail_entity, case=False, na=False)]
-        elif relation == "isFromRegion":
-            filtered_recipes = filtered_recipes[filtered_recipes['CleanedRegion'].str.contains(tail_entity, case=False, na=False)]
-        elif relation == "needTimeToCook":
-            filtered_recipes = filtered_recipes[filtered_recipes['cook_time'].str.contains(tail_entity, case=False, na=False)]
-        elif relation in ["HasCarbLevel", "HasProteinLevel", "HasFatLevel", "HasFiberLevel", "HasSodiumLevel", "HasSugarLevel", "HasCholesterolLevel", "HasCalorieLevel"]:
-            filtered_recipes = filtered_recipes[filtered_recipes['Healthy_Type'].str.contains(tail_entity, case=False, na=False)]
-
-    expected_criteria_match_number = len(filtered_recipes)
-    # Skip the scenario if there are no matches
-    if expected_criteria_match_number == 0:
-        #print(f"Skipping Scenario {idx+1} as no relevant matches were found.")
-        continue
-    mean_count = average_occurrence
-
-    # Perform prediction using the model
-    all_predictions = []
-    
-    for tail_entity, relation in scenario:
-        predicted_heads = predict_target(
-            model=result.model,
-            relation=relation,
-            tail=tail_entity,
-            triples_factory=result.training
-        ).df
-        all_predictions.append(predicted_heads)
-
-    all_predictions_df = pd.concat(all_predictions, ignore_index=True)
-    aggregated_predictions = all_predictions_df.groupby('head_label').agg(
-        total_score=('score', 'sum')
-    ).reset_index()
-
-    final_predictions_sorted = aggregated_predictions.sort_values(by="total_score", ascending=False)
-
-    # Calculate Precision and Recall using the same Top N
-    top_n_scores = final_predictions_sorted["head_label"].head(mean_count)
-    matching_recipes = filtered_recipes[filtered_recipes['Name'].isin(top_n_scores)].drop_duplicates(subset='Name')
-
-    # Calculate sets of predicted and relevant recipes
-    predicted_recipes = set(top_n_scores)
-    relevant_recipes = set(filtered_recipes['Name'])
-
-    # Calculate Precision and Recall using the same Top N
-    top_n_scores_accuracy = final_predictions_sorted["head_label"].head(expected_criteria_match_number)
-    matching_recipes_accuracy = filtered_recipes[filtered_recipes['Name'].isin(top_n_scores_accuracy)]
-
-    true_positives = predicted_recipes.intersection(relevant_recipes)
-    precision = len(true_positives) / len(predicted_recipes) if len(predicted_recipes) > 0 else 0
-    # Recall Calculation
-    Recall = len(true_positives) / len(relevant_recipes) if len(relevant_recipes) > 0 else 0
-
-    Accuracy = len(matching_recipes_accuracy) / expected_criteria_match_number if expected_criteria_match_number > 0 else 0
-
-
-    # Precision Calculation
-    predicted_recipes = set(top_n_scores)
-    relevant_recipes = set(filtered_recipes['Name'])
-
-
-    # F1 Score Calculation
-    if precision + Recall > 0:
-        F1 = 2 * (precision * Recall) / (precision + Recall)
-    else:
-        F1 = 0
-
-    # Store results
-    result_dict = {
-        "Scenario": idx + 1,
-        "Criteria": scenario,
-        "Expected Matches For Recall": expected_criteria_match_number,
-        "Predicted Matches (Recall)": len(matching_recipes),
-        "Recall": Recall,
-        "Expected Matches For Precision": mean_count,
-        "Predicted Matches (Precision)": len(matching_recipes),
-        "Precision": precision,
-        "F1 Score": F1,  # Add F1 Score to results,
-        "Expected Matched For Accuracy":expected_criteria_match_number,
-        "Predicted Matched (Accuracy)":len(matching_recipes_accuracy),
-        "Accuracy":Accuracy
-    }
-    
-    test_results.append(result_dict)
-
-# Convert results into DataFrame
-results_df = pd.DataFrame(test_results)
-
-results_df.to_csv('/app/TuckEREvulationResults/five_criteria_TuckER.csv',index=False)
-
-from itertools import combinations, product
-import random
-
-# Set the random seed for reproducibility
-random.seed(42)
-
-# Extract the top 20 most common ingredients from 'best_foodentityname'
-ingredient_counts = recipes_df['best_foodentityname'].apply(lambda x: [ingredient.strip() for ingredient in x.split(',')]).explode().value_counts()
-top_ingredients = ingredient_counts.head(20).index.tolist()
-
-# Define relation options based on the columns in your dataset
-relation_options = {
-    "HasProteinLevel": ["low_protein", "medium_protein", "high_protein"],
-    "HasCarbLevel": ["low_carb", "medium_carb", "high_carb"],
-    "HasFatLevel": ["low_fat", "medium_fat", "high_fat"],
-    "HasFiberLevel": ["low_fiber", "medium_fiber", "high_fiber"],
-    "HasSodiumLevel": ["low_sodium", "medium_sodium", "high_sodium"],
-    "HasSugarLevel": ["low_sugar", "medium_sugar", "high_sugar"],
-    "HasCholesterolLevel": ["low_cholesterol", "medium_cholesterol", "high_cholesterol"],
-    "HasCalorieLevel": ["low_calorie", "medium_calorie", "high_calorie"],
-    "isForMealType": ["breakfast", "lunch", "dinner", "snack", "dessert", "starter", "brunch", "drink"],
-    "hasDietType": ["vegetarian", "vegan", "paleo", "standard"],
-    "isFromRegion": ["global", "asia", "north_america", "europe", "middle_east", "latin_america_and_caribbean", "oceania", "africa"],
-    "needTimeToCook": ["less_than_60_mins", "less_than_15_mins", "less_than_30_mins", "less_than_6_hours", "less_than_4_hours", "more_than_6_hours"],
-    "contains": top_ingredients
-}
-
-
-# Generate binary combinations (pairs of criteria)
-three_criteria = generate_specific_combinations(relation_options, combination_size=6)
-
-# List of 5000 random samples from the generated three_criteria list
-random_6_user_criteria = random.choices(three_criteria, k=50000)
-
-print(random_6_user_criteria)
-
-# Display the first 20 combinations
-random_6_user_criteria[0:20]
-
-
-test_scenarios = random_6_user_criteria
-
-# Sonucu hesapla
-average_occurrence = calculate_average_occurrence(test_scenarios, recipes_df)
-average_occurrence = int(average_occurrence)
-# Sonucu yazdırma
-print("\nAverage Occurrence for Scenarios:", average_occurrence)
-
-# Initialize a list to store test results
-test_results = []
-
-# Iterate through each test scenario
-for idx, scenario in enumerate(test_scenarios):
-    
-    filtered_recipes = recipes_df
-
-    for tail_entity, relation in scenario:
-        if relation == "hasDietType":
-            filtered_recipes = filtered_recipes[filtered_recipes['Diet_Types'].str.contains(tail_entity, case=False, na=False)]
-        elif relation == "isForMealType":
-            filtered_recipes = filtered_recipes[filtered_recipes['meal_type'].str.contains(tail_entity, case=False, na=False)]
-        elif relation == "isFromRegion":
-            filtered_recipes = filtered_recipes[filtered_recipes['CleanedRegion'].str.contains(tail_entity, case=False, na=False)]
-        elif relation == "needTimeToCook":
-            filtered_recipes = filtered_recipes[filtered_recipes['cook_time'].str.contains(tail_entity, case=False, na=False)]
-        elif relation in ["HasCarbLevel", "HasProteinLevel", "HasFatLevel", "HasFiberLevel", "HasSodiumLevel", "HasSugarLevel", "HasCholesterolLevel", "HasCalorieLevel"]:
-            filtered_recipes = filtered_recipes[filtered_recipes['Healthy_Type'].str.contains(tail_entity, case=False, na=False)]
-
-    expected_criteria_match_number = len(filtered_recipes)
-    # Skip the scenario if there are no matches
-    if expected_criteria_match_number == 0:
-        #print(f"Skipping Scenario {idx+1} as no relevant matches were found.")
-        continue
-    mean_count = average_occurrence
-
-    # Perform prediction using the model
-    all_predictions = []
-    
-    for tail_entity, relation in scenario:
-        predicted_heads = predict_target(
-            model=result.model,
-            relation=relation,
-            tail=tail_entity,
-            triples_factory=result.training
-        ).df
-        all_predictions.append(predicted_heads)
-
-    all_predictions_df = pd.concat(all_predictions, ignore_index=True)
-    aggregated_predictions = all_predictions_df.groupby('head_label').agg(
-        total_score=('score', 'sum')
-    ).reset_index()
-
-    final_predictions_sorted = aggregated_predictions.sort_values(by="total_score", ascending=False)
-
-    # Calculate Precision and Recall using the same Top N
-    top_n_scores = final_predictions_sorted["head_label"].head(mean_count)
-    matching_recipes = filtered_recipes[filtered_recipes['Name'].isin(top_n_scores)].drop_duplicates(subset='Name')
-
-    # Calculate sets of predicted and relevant recipes
-    predicted_recipes = set(top_n_scores)
-    relevant_recipes = set(filtered_recipes['Name'])
-
-    # Calculate Precision and Recall using the same Top N
-    top_n_scores_accuracy = final_predictions_sorted["head_label"].head(expected_criteria_match_number)
-    matching_recipes_accuracy = filtered_recipes[filtered_recipes['Name'].isin(top_n_scores_accuracy)]
-
-    true_positives = predicted_recipes.intersection(relevant_recipes)
-    precision = len(true_positives) / len(predicted_recipes) if len(predicted_recipes) > 0 else 0
-    # Recall Calculation
-    Recall = len(true_positives) / len(relevant_recipes) if len(relevant_recipes) > 0 else 0
-
-    Accuracy = len(matching_recipes_accuracy) / expected_criteria_match_number if expected_criteria_match_number > 0 else 0
-
-
-    # Precision Calculation
-    predicted_recipes = set(top_n_scores)
-    relevant_recipes = set(filtered_recipes['Name'])
-
-
-    # F1 Score Calculation
-    if precision + Recall > 0:
-        F1 = 2 * (precision * Recall) / (precision + Recall)
-    else:
-        F1 = 0
-
-    # Store results
-    result_dict = {
-        "Scenario": idx + 1,
-        "Criteria": scenario,
-        "Expected Matches For Recall": expected_criteria_match_number,
-        "Predicted Matches (Recall)": len(matching_recipes),
-        "Recall": Recall,
-        "Expected Matches For Precision": mean_count,
-        "Predicted Matches (Precision)": len(matching_recipes),
-        "Precision": precision,
-        "F1 Score": F1,  # Add F1 Score to results,
-        "Expected Matched For Accuracy":expected_criteria_match_number,
-        "Predicted Matched (Accuracy)":len(matching_recipes_accuracy),
-        "Accuracy":Accuracy
-    }
-    
-    test_results.append(result_dict)
-
-# Convert results into DataFrame
-results_df = pd.DataFrame(test_results)
-
-results_df.to_csv('/app/TuckEREvulationResults/six_criteria_TuckER.csv',index=False)
-
-from itertools import combinations, product
-import random
-
-# Set the random seed for reproducibility
-random.seed(42)
-
-# Extract the top 20 most common ingredients from 'best_foodentityname'
-ingredient_counts = recipes_df['best_foodentityname'].apply(lambda x: [ingredient.strip() for ingredient in x.split(',')]).explode().value_counts()
-top_ingredients = ingredient_counts.head(20).index.tolist()
-
-# Define relation options based on the columns in your dataset
-relation_options = {
-    "HasProteinLevel": ["low_protein", "medium_protein", "high_protein"],
-    "HasCarbLevel": ["low_carb", "medium_carb", "high_carb"],
-    "HasFatLevel": ["low_fat", "medium_fat", "high_fat"],
-    "HasFiberLevel": ["low_fiber", "medium_fiber", "high_fiber"],
-    "HasSodiumLevel": ["low_sodium", "medium_sodium", "high_sodium"],
-    "HasSugarLevel": ["low_sugar", "medium_sugar", "high_sugar"],
-    "HasCholesterolLevel": ["low_cholesterol", "medium_cholesterol", "high_cholesterol"],
-    "HasCalorieLevel": ["low_calorie", "medium_calorie", "high_calorie"],
-    "isForMealType": ["breakfast", "lunch", "dinner", "snack", "dessert", "starter", "brunch", "drink"],
-    "hasDietType": ["vegetarian", "vegan", "paleo", "standard"],
-    "isFromRegion": ["global", "asia", "north_america", "europe", "middle_east", "latin_america_and_caribbean", "oceania", "africa"],
-    "needTimeToCook": ["less_than_60_mins", "less_than_15_mins", "less_than_30_mins", "less_than_6_hours", "less_than_4_hours", "more_than_6_hours"],
-    "contains": top_ingredients
-}
-
-
-# Generate binary combinations (pairs of criteria)
-three_criteria = generate_specific_combinations(relation_options, combination_size=7)
-
-# List of 5000 random samples from the generated three_criteria list
-random_7_user_criteria = random.choices(three_criteria, k=50000)
-
-print(random_7_user_criteria)
-
-# Display the first 20 combinations
-random_7_user_criteria[0:20]
-
-
-
-test_scenarios = random_7_user_criteria
-
-# Sonucu hesapla
-average_occurrence = calculate_average_occurrence(test_scenarios, recipes_df)
-average_occurrence = int(average_occurrence)
-# Sonucu yazdırma
-print("\nAverage Occurrence for Scenarios:", average_occurrence)
-
-# Initialize a list to store test results
-test_results = []
-
-# Iterate through each test scenario
-for idx, scenario in enumerate(test_scenarios):
-    
-    filtered_recipes = recipes_df
-
-    for tail_entity, relation in scenario:
-        if relation == "hasDietType":
-            filtered_recipes = filtered_recipes[filtered_recipes['Diet_Types'].str.contains(tail_entity, case=False, na=False)]
-        elif relation == "isForMealType":
-            filtered_recipes = filtered_recipes[filtered_recipes['meal_type'].str.contains(tail_entity, case=False, na=False)]
-        elif relation == "isFromRegion":
-            filtered_recipes = filtered_recipes[filtered_recipes['CleanedRegion'].str.contains(tail_entity, case=False, na=False)]
-        elif relation == "needTimeToCook":
-            filtered_recipes = filtered_recipes[filtered_recipes['cook_time'].str.contains(tail_entity, case=False, na=False)]
-        elif relation in ["HasCarbLevel", "HasProteinLevel", "HasFatLevel", "HasFiberLevel", "HasSodiumLevel", "HasSugarLevel", "HasCholesterolLevel", "HasCalorieLevel"]:
-            filtered_recipes = filtered_recipes[filtered_recipes['Healthy_Type'].str.contains(tail_entity, case=False, na=False)]
-
-    expected_criteria_match_number = len(filtered_recipes)
-    # Skip the scenario if there are no matches
-    if expected_criteria_match_number == 0:
-        #print(f"Skipping Scenario {idx+1} as no relevant matches were found.")
-        continue
-    mean_count = average_occurrence
-
-    # Perform prediction using the model
-    all_predictions = []
-    
-    for tail_entity, relation in scenario:
-        predicted_heads = predict_target(
-            model=result.model,
-            relation=relation,
-            tail=tail_entity,
-            triples_factory=result.training
-        ).df
-        all_predictions.append(predicted_heads)
-
-    all_predictions_df = pd.concat(all_predictions, ignore_index=True)
-    aggregated_predictions = all_predictions_df.groupby('head_label').agg(
-        total_score=('score', 'sum')
-    ).reset_index()
-
-    final_predictions_sorted = aggregated_predictions.sort_values(by="total_score", ascending=False)
-
-    # Calculate Precision and Recall using the same Top N
-    top_n_scores = final_predictions_sorted["head_label"].head(mean_count)
-    matching_recipes = filtered_recipes[filtered_recipes['Name'].isin(top_n_scores)].drop_duplicates(subset='Name')
-
-    # Calculate sets of predicted and relevant recipes
-    predicted_recipes = set(top_n_scores)
-    relevant_recipes = set(filtered_recipes['Name'])
-
-    # Calculate Precision and Recall using the same Top N
-    top_n_scores_accuracy = final_predictions_sorted["head_label"].head(expected_criteria_match_number)
-    matching_recipes_accuracy = filtered_recipes[filtered_recipes['Name'].isin(top_n_scores_accuracy)]
-
-    true_positives = predicted_recipes.intersection(relevant_recipes)
-    precision = len(true_positives) / len(predicted_recipes) if len(predicted_recipes) > 0 else 0
-    # Recall Calculation
-    Recall = len(true_positives) / len(relevant_recipes) if len(relevant_recipes) > 0 else 0
-
-    Accuracy = len(matching_recipes_accuracy) / expected_criteria_match_number if expected_criteria_match_number > 0 else 0
-
-
-    # Precision Calculation
-    predicted_recipes = set(top_n_scores)
-    relevant_recipes = set(filtered_recipes['Name'])
-
-
-    # F1 Score Calculation
-    if precision + Recall > 0:
-        F1 = 2 * (precision * Recall) / (precision + Recall)
-    else:
-        F1 = 0
-
-    # Store results
-    result_dict = {
-        "Scenario": idx + 1,
-        "Criteria": scenario,
-        "Expected Matches For Recall": expected_criteria_match_number,
-        "Predicted Matches (Recall)": len(matching_recipes),
-        "Recall": Recall,
-        "Expected Matches For Precision": mean_count,
-        "Predicted Matches (Precision)": len(matching_recipes),
-        "Precision": precision,
-        "F1 Score": F1,  # Add F1 Score to results,
-        "Expected Matched For Accuracy":expected_criteria_match_number,
-        "Predicted Matched (Accuracy)":len(matching_recipes_accuracy),
-        "Accuracy":Accuracy
-    }
-    
-    test_results.append(result_dict)
-#─# nohup python3 DistMult.py > output.log   
-# Convert results into DataFrame
-results_df = pd.DataFrame(test_results)
-
-
-results_df.to_csv('/app/TuckEREvulationResults/seven_criteria_TuckER.csv',index=False)
-
-from itertools import combinations, product
-import random
-
-# Set the random seed for reproducibility
-random.seed(42)
-
-# Extract the top 20 most common ingredients from 'best_foodentityname'
-ingredient_counts = recipes_df['best_foodentityname'].apply(lambda x: [ingredient.strip() for ingredient in x.split(',')]).explode().value_counts()
-top_ingredients = ingredient_counts.head(20).index.tolist()
-
-# Define relation options based on the columns in your dataset
-relation_options = {
-    "HasProteinLevel": ["low_protein", "medium_protein", "high_protein"],
-    "HasCarbLevel": ["low_carb", "medium_carb", "high_carb"],
-    "HasFatLevel": ["low_fat", "medium_fat", "high_fat"],
-    "HasFiberLevel": ["low_fiber", "medium_fiber", "high_fiber"],
-    "HasSodiumLevel": ["low_sodium", "medium_sodium", "high_sodium"],
-    "HasSugarLevel": ["low_sugar", "medium_sugar", "high_sugar"],
-    "HasCholesterolLevel": ["low_cholesterol", "medium_cholesterol", "high_cholesterol"],
-    "HasCalorieLevel": ["low_calorie", "medium_calorie", "high_calorie"],
-    "isForMealType": ["breakfast", "lunch", "dinner", "snack", "dessert", "starter", "brunch", "drink"],
-    "hasDietType": ["vegetarian", "vegan", "paleo", "standard"],
-    "isFromRegion": ["global", "asia", "north_america", "europe", "middle_east", "latin_america_and_caribbean", "oceania", "africa"],
-    "needTimeToCook": ["less_than_60_mins", "less_than_15_mins", "less_than_30_mins", "less_than_6_hours", "less_than_4_hours", "more_than_6_hours"],
-    "contains": top_ingredients
-}
-
-
-# Generate binary combinations (pairs of criteria)
-three_criteria = generate_specific_combinations(relation_options, combination_size=8)
-
-# List of 5000 random samples from the generated three_criteria list
-random_8_user_criteria = random.choices(three_criteria, k=50000)
-
-print(random_8_user_criteria)
-
-# Display the first 20 combinations
-random_8_user_criteria[0:20]
-
-
-test_scenarios = random_8_user_criteria
-
-# Sonucu hesapla
-average_occurrence = calculate_average_occurrence(test_scenarios, recipes_df)
-average_occurrence = int(average_occurrence)
-# Sonucu yazdırma
-print("\nAverage Occurrence for Scenarios:", average_occurrence)
-
-# Initialize a list to store test results
-test_results = []
-
-# Iterate through each test scenario
-for idx, scenario in enumerate(test_scenarios):
-    
-    filtered_recipes = recipes_df
-
-    for tail_entity, relation in scenario:
-        if relation == "hasDietType":
-            filtered_recipes = filtered_recipes[filtered_recipes['Diet_Types'].str.contains(tail_entity, case=False, na=False)]
-        elif relation == "isForMealType":
-            filtered_recipes = filtered_recipes[filtered_recipes['meal_type'].str.contains(tail_entity, case=False, na=False)]
-        elif relation == "isFromRegion":
-            filtered_recipes = filtered_recipes[filtered_recipes['CleanedRegion'].str.contains(tail_entity, case=False, na=False)]
-        elif relation == "needTimeToCook":
-            filtered_recipes = filtered_recipes[filtered_recipes['cook_time'].str.contains(tail_entity, case=False, na=False)]
-        elif relation in ["HasCarbLevel", "HasProteinLevel", "HasFatLevel", "HasFiberLevel", "HasSodiumLevel", "HasSugarLevel", "HasCholesterolLevel", "HasCalorieLevel"]:
-            filtered_recipes = filtered_recipes[filtered_recipes['Healthy_Type'].str.contains(tail_entity, case=False, na=False)]
-
-    expected_criteria_match_number = len(filtered_recipes)
-    # Skip the scenario if there are no matches
-    if expected_criteria_match_number == 0:
-        #print(f"Skipping Scenario {idx+1} as no relevant matches were found.")
-        continue
-    mean_count = average_occurrence
-
-    # Perform prediction using the model
-    all_predictions = []
-    
-    for tail_entity, relation in scenario:
-        predicted_heads = predict_target(
-            model=result.model,
-            relation=relation,
-            tail=tail_entity,
-            triples_factory=result.training
-        ).df
-        all_predictions.append(predicted_heads)
-
-    all_predictions_df = pd.concat(all_predictions, ignore_index=True)
-    aggregated_predictions = all_predictions_df.groupby('head_label').agg(
-        total_score=('score', 'sum')
-    ).reset_index()
-
-    final_predictions_sorted = aggregated_predictions.sort_values(by="total_score", ascending=False)
-
-    # Calculate Precision and Recall using the same Top N
-    top_n_scores = final_predictions_sorted["head_label"].head(mean_count)
-    matching_recipes = filtered_recipes[filtered_recipes['Name'].isin(top_n_scores)].drop_duplicates(subset='Name')
-
-    # Calculate sets of predicted and relevant recipes
-    predicted_recipes = set(top_n_scores)
-    relevant_recipes = set(filtered_recipes['Name'])
-
-    # Calculate Precision and Recall using the same Top N
-    top_n_scores_accuracy = final_predictions_sorted["head_label"].head(expected_criteria_match_number)
-    matching_recipes_accuracy = filtered_recipes[filtered_recipes['Name'].isin(top_n_scores_accuracy)]
-
-    true_positives = predicted_recipes.intersection(relevant_recipes)
-    precision = len(true_positives) / len(predicted_recipes) if len(predicted_recipes) > 0 else 0
-    # Recall Calculation
-    Recall = len(true_positives) / len(relevant_recipes) if len(relevant_recipes) > 0 else 0
-
-    Accuracy = len(matching_recipes_accuracy) / expected_criteria_match_number if expected_criteria_match_number > 0 else 0
-
-
-    # Precision Calculation
-    predicted_recipes = set(top_n_scores)
-    relevant_recipes = set(filtered_recipes['Name'])
-
-
-    # F1 Score Calculation
-    if precision + Recall > 0:
-        F1 = 2 * (precision * Recall) / (precision + Recall)
-    else:
-        F1 = 0
-
-    # Store results
-    result_dict = {
-        "Scenario": idx + 1,
-        "Criteria": scenario,
-        "Expected Matches For Recall": expected_criteria_match_number,
-        "Predicted Matches (Recall)": len(matching_recipes),
-        "Recall": Recall,
-        "Expected Matches For Precision": mean_count,
-        "Predicted Matches (Precision)": len(matching_recipes),
-        "Precision": precision,
-        "F1 Score": F1,  # Add F1 Score to results,
-        "Expected Matched For Accuracy":expected_criteria_match_number,
-        "Predicted Matched (Accuracy)":len(matching_recipes_accuracy),
-        "Accuracy":Accuracy
-    }
-    test_results.append(result_dict)
-
-# Convert results into DataFrame
-results_df = pd.DataFrame(test_results)
-
-results_df.to_csv('/app/TuckEREvulationResults/eight_criteria_TuckER.csv',index=False)
-
+        logging.warning(f"No valid results generated for size {combination_size}. No CSV file saved.")
+
+    logging.info(f"--- Finished Evaluation for Combination Size: {combination_size} ---")
+
+# --- Main Execution ---
+
+def main():
+    """Main function to orchestrate the workflow."""
+    logging.info("Starting Recipe KGE Pipeline...")
+    random.seed(RANDOM_SEED)
+    np.random.seed(RANDOM_SEED)
+
+    # Ensure results directory exists
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # --- Data Loading and Graph Creation ---
+    recipes_df_raw = load_and_preprocess_recipes(INPUT_CSV_PATH)
+    _, triples_array = create_graph_and_triples(recipes_df_raw) # Graph G is not used later, can omit assignment
+    save_triples(triples_array, TRIPLES_OUTPUT_PATH)
+
+    # --- KGE Model Training ---
+    # Load triples from the saved file
+    try:
+        triples_for_training = pd.read_csv(TRIPLES_OUTPUT_PATH).dropna().values
+        triples_factory = TriplesFactory.from_labeled_triples(triples_for_training)
+        logging.info("TriplesFactory created successfully.")
+    except Exception as e:
+        logging.error(f"Failed to load triples or create TriplesFactory: {e}")
+        return # Stop execution if triples can't be loaded
+
+    model_result = train_kge_model(triples_factory, KGE_MODEL, EPOCHS, RESULTS_DIR, EARLY_STOPPING_PATIENCE)
+
+    # --- Evaluation Phase ---
+    logging.info("--- Starting Scenario Evaluation Phase ---")
+    # Preprocess the original DataFrame for filtering during evaluation
+    recipes_df_processed = preprocess_dataframe_for_evaluation(recipes_df_raw)
+
+    # Determine top ingredients and relation options
+    top_ingredients = get_top_ingredients(recipes_df_processed, TOP_N_INGREDIENTS)
+    relation_options = define_relation_options(top_ingredients)
+
+    # Run evaluation for each combination size
+    for i in range(1, MAX_CRITERIA_COMBINATIONS + 1):
+        evaluate_scenarios(
+            model_result=model_result,
+            recipes_df_processed=recipes_df_processed,
+            relation_options=relation_options,
+            combination_size=i,
+            num_samples=NUM_RANDOM_SAMPLES_PER_SIZE,
+            results_dir=RESULTS_DIR
+        )
+
+    logging.info("Recipe KGE Pipeline finished successfully.")
+
+
+if __name__ == "__main__":
+    main()
